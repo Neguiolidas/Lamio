@@ -7,6 +7,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <map>
 #include <memory>
 
 namespace lamio {
@@ -38,8 +39,19 @@ public:
     // Loads the k selected experts into cache and patches tensor data pointers.
     void on_expert_select(int layer, const int * selected_experts, int k);
 
+    // Alias used by the eval callback
+    void on_select(int layer, const int * selected_experts, int k) {
+        on_expert_select(layer, selected_experts, k);
+    }
+
     // Get pointer to cached data for an expert.
     void * get_expert_data(int layer, int eid) const;
+
+    // Buffer management for expert weight tensors.
+    // The eval callback needs to allocate a buffer for the full expert tensor
+    // (all experts, not just selected ones) and fill in the selected slices.
+    void * allocate_expert_buffer(int layer, const char * name, size_t total_size);
+    void * get_expert_buffer(int layer, const char * name);
 
     bool is_enabled() const { return enabled_; }
     void set_enabled(bool on) { enabled_ = on; }
@@ -65,6 +77,10 @@ private:
     // Lookup tensor name by (layer, type_idx)
     // type_idx: 0=up, 1=gate, 2=down
     const expert_tensor_info * find_tensor_info(int layer, int type_idx) const;
+
+    // Per-tensor buffers allocated on demand for the full expert tensor
+    // (keyed by tensor name)
+    std::map<std::string, void *> expert_buffers_;
 };
 
 // Check if a tensor name matches the expert tensor pattern.

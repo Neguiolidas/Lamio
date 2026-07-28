@@ -70,4 +70,25 @@ const tier_bridge::expert_tensor_info * tier_bridge::find_tensor_info(int layer,
     return &tensor_infos_[key];
 }
 
+void * tier_bridge::allocate_expert_buffer(int layer, const char * name, size_t total_size) {
+    if (!name || total_size == 0) return nullptr;
+    std::string key(name);
+    auto it = expert_buffers_.find(key);
+    if (it != expert_buffers_.end()) return it->second;
+
+    void * buf = new uint8_t[total_size];
+    if (buf) {
+        memset(buf, 0, total_size);
+        expert_buffers_[key] = buf;
+    }
+    return buf;
+}
+
+void * tier_bridge::get_expert_buffer(int layer, const char * name) {
+    if (!name) return nullptr;
+    auto it = expert_buffers_.find(std::string(name));
+    if (it != expert_buffers_.end()) return it->second;
+    return nullptr;
+}
+
 } // namespace lamio

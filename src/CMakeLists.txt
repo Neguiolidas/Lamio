@@ -43,6 +43,7 @@ add_library(llama
             lamio/tier_manager.cpp
             lamio/expert_loader.cpp
             lamio/tier_bridge.cpp
+            lamio/lamio_eval_callback.cpp
             ${LLAMA_MODELS_SOURCES}
             )
 
