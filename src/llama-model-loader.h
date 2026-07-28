@@ -97,6 +97,7 @@ struct llama_model_loader {
     std::vector<ggml_context_ptr> contexts;
 
     std::string arch_name;
+    std::string model_path;  // Lamio: store original file path for expert_loader
     LLM_KV      llm_kv    = LLM_KV(LLM_ARCH_UNKNOWN);
 
     size_t size_done = 0;

@@ -18,6 +18,7 @@
 
 #include "llama.h"
 #include "models/models.h"
+#include "lamio/tier_bridge.h"
 
 #include "ggml.h"
 #include "ggml-cpp.h"
@@ -1264,6 +1265,19 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (load_mode = %s)\n",
         __func__, llama_load_mode_name(params.load_mode));
 
+    // Lamio: initialize expert tiering if budget is set
+    if (params.lamio_tier_budget > 0 && hparams.n_expert > 0) {
+        size_t budget_bytes = (size_t)params.lamio_tier_budget * 1024 * 1024;
+        auto & bridge = lamio::tier_bridge::instance();
+        if (bridge.init(ml.model_path.c_str(),
+                        budget_bytes, hparams.n_layer(), hparams.n_expert)) {
+            LLAMA_LOG_INFO("%s: lamio tiering enabled, budget = %d MiB\n",
+                           __func__, params.lamio_tier_budget);
+        } else {
+            LLAMA_LOG_WARN("%s: lamio tiering init failed, falling back to full load\n", __func__);
+        }
+    }
+
     // build a list of buffer types for the CPU and GPU devices
     pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host);
     for (const auto & dev : devices) {
@@ -2338,6 +2352,7 @@ llama_model_params llama_model_default_params() {
         /*.use_extra_bufts             =*/ true,
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
+        /*.lamio_tier_budget           =*/ 0,
     };
 
     return result;

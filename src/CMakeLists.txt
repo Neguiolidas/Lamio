@@ -40,6 +40,9 @@ add_library(llama
             unicode-data.cpp
             unicode.cpp
             unicode.h
+            lamio/tier_manager.cpp
+            lamio/expert_loader.cpp
+            lamio/tier_bridge.cpp
             ${LLAMA_MODELS_SOURCES}
             )
 

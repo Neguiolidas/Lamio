@@ -5,6 +5,7 @@
 #include "gguf.h"
 #include "llama-hparams.h"
 #include "llama.h"
+#include "lamio/tier_bridge.h"
 
 #include <algorithm>
 #include <array>
@@ -561,6 +562,8 @@ llama_model_loader::llama_model_loader(
 
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
+
+        model_path = fname; // Lamio: store for expert_loader
 
         files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
         contexts.emplace_back(ctx);
@@ -1519,6 +1522,22 @@ bool llama_model_loader::load_all_data(
         if (weight == nullptr) {
             // this can happen with split experts models
             continue;
+        }
+
+        // Lamio: skip expert tensors when tiering is enabled
+        if (lamio::tier_bridge::is_expert_tensor(ggml_get_name(cur))) {
+            auto & bridge = lamio::tier_bridge::instance();
+            if (bridge.is_enabled()) {
+                // Register the tensor info for later lazy loading
+                size_t expert_bytes = ggml_nbytes(cur) / cur->ne[2]; // one expert slice
+                size_t tensor_stride = expert_bytes;
+                bridge.register_expert_tensor(ggml_get_name(cur), 0,
+                                               tensor_stride, expert_bytes);
+                LLAMA_LOG_DEBUG("%s: lamio tiering: skipped expert tensor %s (%zu bytes)\n",
+                                __func__, ggml_get_name(cur), ggml_nbytes(cur));
+                size_done += ggml_nbytes(cur);
+                continue;
+            }
         }
 
         if (progress_callback) {

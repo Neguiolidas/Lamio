@@ -1,0 +1,73 @@
+#include "tier_bridge.h"
+
+namespace lamio {
+
+tier_bridge & tier_bridge::instance() {
+    static tier_bridge inst;
+    return inst;
+}
+
+bool tier_bridge::init(const char * gguf_path, size_t ram_budget,
+                       int n_layers, int n_expert) {
+    if (!loader_.open(gguf_path)) {
+        return false;
+    }
+
+    // Create tier manager with budget
+    manager_ = std::make_unique<tier_manager>(ram_budget, n_layers, n_expert);
+
+    // Set load callback: dispatch by (layer, eid) to load all 3 expert tensors.
+    // The type_idx encodes which tensor (0=up, 1=gate, 2=down) via high bits.
+    // tier_manager only tracks (layer, eid) pairs, so we load all 3 at once.
+    manager_->set_load_callback([](int layer, int eid, void * dest, size_t size) -> bool {
+        tier_bridge & self = instance();
+        const expert_tensor_info * info = self.find_tensor_info(layer, 0); // 0 = up
+        if (!info) return false;
+        size_t n = self.loader_.read_expert_slice(info->name.c_str(), eid,
+                                                   info->expert_bytes,
+                                                   dest, size);
+        return n > 0;
+    });
+
+    enabled_ = true;
+    return true;
+}
+
+void tier_bridge::register_expert_tensor(const char * tensor_name, int eid,
+                                          size_t tensor_stride, size_t expert_bytes) {
+    // Parse layer number from tensor name "blk.N.ffn_*_exps.weight"
+    int layer = -1;
+    if (sscanf(tensor_name, "blk.%d.", &layer) != 1) return;
+
+    // Determine type_idx: 0=up, 1=gate, 2=down
+    int type_idx = -1;
+    if (strstr(tensor_name, "ffn_up_exps"))       type_idx = 0;
+    else if (strstr(tensor_name, "ffn_gate_exps")) type_idx = 1;
+    else if (strstr(tensor_name, "ffn_down_exps"))type_idx = 2;
+    if (type_idx < 0) return;
+
+    int key = layer * 3 + type_idx;
+    if (key >= (int)tensor_infos_.size()) {
+        tensor_infos_.resize(key + 1);
+    }
+
+    tensor_infos_[key] = {tensor_name, expert_bytes, tensor_stride};
+}
+
+void tier_bridge::on_expert_select(int layer, const int * selected_experts, int k) {
+    if (!enabled_ || !manager_) return;
+    manager_->on_select(layer, selected_experts, k);
+}
+
+void * tier_bridge::get_expert_data(int layer, int eid) const {
+    if (!enabled_ || !manager_) return nullptr;
+    return manager_->get_data(layer, eid);
+}
+
+const tier_bridge::expert_tensor_info * tier_bridge::find_tensor_info(int layer, int type_idx) const {
+    int key = layer * 3 + type_idx;
+    if (key < 0 || key >= (int)tensor_infos_.size()) return nullptr;
+    return &tensor_infos_[key];
+}
+
+} // namespace lamio
