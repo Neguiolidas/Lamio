@@ -5,6 +5,8 @@
 #include <unordered_map>
 #include <cstddef>
 #include <cstdint>
+#include <future>
+#include <mutex>
 
 namespace lamio {
 
@@ -60,6 +62,11 @@ public:
     // Called after router selects top-k experts, before mul_mat_id.
     void on_select(int layer, const int * selected_experts, int k);
 
+    // Async version: kicks off pread for all selected experts, returns immediately.
+    // Call wait_async() before get_data().
+    void on_select_async(int layer, const int * selected_experts, int k);
+    void wait_async(int layer, int eid);
+
     // Bump heat for a resident expert.
     void bump_heat(int layer, int eid);
 
@@ -108,6 +115,16 @@ private:
 
     int stats_hits   = 0;
     int stats_misses = 0;
+
+    // Async loading: pending futures for each (layer, eid)
+    struct pending_load {
+        std::future<bool> fut;
+        int layer;
+        int eid;
+    };
+    std::vector<pending_load> pending_loads_;
+    std::mutex pending_mtx_;
+    static constexpr int MAX_PENDING = 64;
 
     int n_expert;
     int idx(int layer, int eid) const { return layer * n_expert + eid; }

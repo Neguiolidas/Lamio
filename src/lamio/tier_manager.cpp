@@ -162,6 +162,81 @@ void tier_manager::on_select(int layer, const int * selected_experts, int k) {
     }
 }
 
+void tier_manager::on_select_async(int layer, const int * selected_experts, int k) {
+    std::lock_guard<std::mutex> lk(pending_mtx_);
+    for (int i = 0; i < k; i++) {
+        int eid = selected_experts[i];
+        if (eid < 0) continue;
+
+        // Already resident? skip
+        if (is_resident(layer, eid)) {
+            bump_heat(layer, eid);
+            stats_hits++;
+            continue;
+        }
+
+        // Find record for size
+        expert_key key{layer, eid};
+        auto rit = registry.find(key);
+        if (rit == registry.end()) continue;
+
+        // Evict to make room (synchronous, fast)
+        auto & lc = caches[layer];
+        size_t needed = rit->second.byte_size;
+        int max_evict = 64;
+        while (lc.used_bytes + needed > lc.capacity_bytes && !lc.slots.empty() && max_evict-- > 0) {
+            evict_one(layer);
+        }
+
+        // Find or create slot
+        int slot_idx = -1;
+        for (int j = 0; j < (int)lc.slots.size(); j++) {
+            if (!lc.slots[j].valid) { slot_idx = j; break; }
+        }
+        if (slot_idx < 0) {
+            slot_idx = (int)lc.slots.size();
+            lc.slots.push_back({});
+        }
+
+        auto & slot = lc.slots[slot_idx];
+        if (slot.size < needed) {
+            delete[] (uint8_t*)slot.data;
+            slot.data = new uint8_t[needed];
+            slot.size = needed;
+        }
+        slot.layer = layer;
+        slot.expert_id = eid;
+        slot.valid = true;
+        slot.heat = 0;
+        slot.last_access = 0;
+        lc.expert_to_slot[eid] = slot_idx;
+        lc.used_bytes += needed;
+
+        // Async pread: launch load_cb in a future
+        void * dest = slot.data;
+        size_t sz = needed;
+        load_fn cb = load_cb;
+        pending_loads_.push_back({std::async(std::launch::async,
+            [cb, layer, eid, dest, sz]() -> bool {
+                return cb(layer, eid, dest, sz);
+            }), layer, eid});
+
+        stats_misses++;
+    }
+}
+
+void tier_manager::wait_async(int layer, int eid) {
+    std::lock_guard<std::mutex> lk(pending_mtx_);
+    for (auto it = pending_loads_.begin(); it != pending_loads_.end(); ++it) {
+        if (it->layer == layer && it->eid == eid) {
+            it->fut.wait();
+            bump_heat(layer, eid);
+            pending_loads_.erase(it);
+            return;
+        }
+    }
+}
+
 void tier_manager::decay_all() {
     tier_decay(heat);
 }

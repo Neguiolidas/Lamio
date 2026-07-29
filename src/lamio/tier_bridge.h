@@ -44,6 +44,16 @@ public:
         on_expert_select(layer, selected_experts, k);
     }
 
+    // Async select + wait
+    void on_select_async(int layer, const int * selected_experts, int k) {
+        if (!enabled_ || !manager_) return;
+        manager_->on_select_async(layer, selected_experts, k);
+    }
+    void wait_async(int layer, int eid) {
+        if (!enabled_ || !manager_) return;
+        manager_->wait_async(layer, eid);
+    }
+
     // Get pointer to cached data for an expert.
     void * get_expert_data(int layer, int eid) const;
 
