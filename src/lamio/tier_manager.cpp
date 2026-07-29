@@ -10,7 +10,19 @@ tier_manager::~tier_manager() {
                 slot.data = nullptr;
             }
         }
+        lc.slots.clear();
+        lc.expert_to_slot.clear();
     }
+    caches.clear();
+    registry.clear();
+
+    // Discard any pending async loads without waiting
+    for (auto & pl : pending_loads_) {
+        if (pl.fut.valid()) {
+            try { pl.fut.wait(); } catch (...) {}
+        }
+    }
+    pending_loads_.clear();
 }
 
 tier_manager::tier_manager(size_t ram_budget_bytes, int n_layers, int n_expert_per_layer)

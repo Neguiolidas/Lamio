@@ -10,6 +10,7 @@
 #include <set>
 #include <sys/mman.h>
 #include <cstdint>
+#include <unistd.h>
 
 namespace lamio {
 
@@ -72,60 +73,23 @@ bool lamio_eval_callback(ggml_tensor * t, bool ask, void * user_data) {
 
     if (n_selected == 0) return true;
 
-    // Determine which expert tensor type this is (up, gate, down)
-    int type_idx = -1;
-    const char * wname = ggml_get_name(weights);
-    if (strstr(wname, "ffn_up_exps"))       type_idx = 0;
-    else if (strstr(wname, "ffn_gate_exps")) type_idx = 1;
-    else if (strstr(wname, "ffn_down_exps"))type_idx = 2;
-    if (type_idx < 0) return true;
-
-    // Async: kick off pread for all selected experts, then wait+memcpy.
-    // This overlaps disk I/O with compute from prior layers.
-    bridge.on_select_async(layer, selected, n_selected);
-
     const size_t expert_stride = weights->nb[2];
     const size_t expert_size   = ggml_nbytes(weights) / weights->ne[2];
 
+    // Phase 2+3: WILLNEED prefetch on selected expert pages.
+    // DONTNEED is already done once at load time (phase 2).
+    // The kernel readahead pulls in the selected expert pages async.
     for (int i = 0; i < n_selected; i++) {
         int eid = selected[i];
-
-        // Wait for async pread to complete
-        bridge.wait_async(layer, eid);
-
-        void * src = bridge.get_expert_data(layer, eid);
-        if (src) {
-            void * dst = (uint8_t *)weights->data + eid * expert_stride;
-            memcpy(dst, src, expert_size);
-        }
-    }
-
-    // DONTNEED selective: evict mmap pages for non-selected experts
-    // to free page cache. Safe because selected experts are now in slots.
-    {
-        const int n_experts_total = (int)weights->ne[2];
-        // Build a quick lookup of selected experts
-        bool selected_mask[256] = {};
-        for (int i = 0; i < n_selected; i++) {
-            if (selected[i] >= 0 && selected[i] < 256) {
-                selected_mask[selected[i]] = true;
-            }
-        }
-        // Advise kernel to drop pages for non-selected experts
-        for (int e = 0; e < n_experts_total && e < 256; e++) {
-            if (!selected_mask[e]) {
-                void * page = (uint8_t *)weights->data + e * expert_stride;
-                size_t len = expert_size;
-                // Align to page boundary
-                size_t page_size = 4096;
-                uintptr_t start = (uintptr_t)page;
-                uintptr_t end = start + len;
-                start &= ~(page_size - 1);
-                end = (end + page_size - 1) & ~(page_size - 1);
-                if (end > start) {
-                    madvise((void *)start, end - start, MADV_DONTNEED);
-                }
-            }
+        if (eid < 0) continue;
+        void * page = (uint8_t *)weights->data + eid * expert_stride;
+        size_t page_size = 4096;
+        uintptr_t start = (uintptr_t)page;
+        uintptr_t end = start + expert_size;
+        start &= ~(page_size - 1);
+        end = (end + page_size - 1) & ~(page_size - 1);
+        if (end > start) {
+            madvise((void *)start, end - start, MADV_WILLNEED);
         }
     }
 

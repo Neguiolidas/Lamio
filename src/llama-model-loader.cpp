@@ -11,6 +11,7 @@
 #include <array>
 #include <cinttypes>
 #include <cstdint>
+#include <sys/mman.h>
 #include <cstring>
 #include <future>
 #include <regex>
@@ -1545,9 +1546,26 @@ bool llama_model_loader::load_all_data(
                         buf_mmap = bufs.at(weight->idx);
                     }
                     GGML_ASSERT(buf_mmap);
-                    // Point cur->data at the mmap region so the eval callback
-                    // can memcpy expert slices into it from the tier_manager slots.
                     ggml_backend_tensor_alloc(buf_mmap, cur, (uint8_t *) mapping->addr() + weight->offs);
+                }
+
+                // Phase 2: DONTNEED on the entire expert tensor after allocation.
+                // The mmap pages are loaded during file mapping but we don't need
+                // them in RAM until the eval callback selects them. The kernel
+                // will re-fault them on demand when WILLNEED or first access.
+                if (cur->data) {
+                    size_t page_size = 4096;
+                    uintptr_t start = (uintptr_t)cur->data;
+                    uintptr_t end = start + n_size;
+                    start &= ~(page_size - 1);
+                    end = (end + page_size - 1) & ~(page_size - 1);
+                    if (end > start) {
+                        madvise((void *)start, end - start, MADV_DONTNEED);
+                    }
+                    size_t total_evicted = ggml_nbytes(cur);
+                    LLAMA_LOG_DEBUG("%s: lamio: DONTNEED expert tensor %s (%zu MB, total evicted %zu MB)\n",
+                                    __func__, ggml_get_name(cur), n_size / 1024 / 1024,
+                                    total_evicted / 1024 / 1024);
                 }
 
                 size_done += n_size;
