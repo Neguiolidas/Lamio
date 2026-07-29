@@ -1535,7 +1535,22 @@ bool llama_model_loader::load_all_data(
                                                tensor_stride, expert_bytes);
                 LLAMA_LOG_DEBUG("%s: lamio tiering: skipped expert tensor %s (%zu bytes)\n",
                                 __func__, ggml_get_name(cur), ggml_nbytes(cur));
-                size_done += ggml_nbytes(cur);
+
+                // Allocate backend buffer for the tensor (data will be filled by eval callback)
+                size_t n_size = ggml_nbytes(cur);
+                if (use_mmap && cur->data == nullptr) {
+                    const auto & mapping = mappings.at(weight->idx);
+                    ggml_backend_buffer_t buf_mmap = nullptr;
+                    if (bufs.count(weight->idx)) {
+                        buf_mmap = bufs.at(weight->idx);
+                    }
+                    GGML_ASSERT(buf_mmap);
+                    // Point cur->data at the mmap region so the eval callback
+                    // can memcpy expert slices into it from the tier_manager slots.
+                    ggml_backend_tensor_alloc(buf_mmap, cur, (uint8_t *) mapping->addr() + weight->offs);
+                }
+
+                size_done += n_size;
                 continue;
             }
         }
