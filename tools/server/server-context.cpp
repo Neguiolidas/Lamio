@@ -16,6 +16,7 @@
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include "lamio/tier_bridge.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -4334,6 +4335,33 @@ void server_routes::init_routes() {
         GGML_UNUSED(ctx_server);
 
         res->ok({{"status", "ok"}});
+        return res;
+    };
+
+    this->get_lamio_tier = [this](const server_http_req & req) {
+        auto res = create_response();
+        auto & bridge = lamio::tier_bridge::instance();
+        if (!bridge.is_enabled()) {
+            res->ok(json {
+                {"enabled", false}
+            });
+            return res;
+        }
+        const auto & mgr = bridge.manager();
+        json j = {
+            {"enabled",         true},
+            {"hits",            mgr.total_hits()},
+            {"misses",          mgr.total_misses()},
+            {"evictions",       mgr.total_evictions()},
+            {"load_time_ms",    mgr.total_load_time_ms()},
+            {"bytes_loaded",    mgr.total_bytes_loaded()},
+            {"used_mb",         mgr.used_mb()},
+            {"capacity_mb",     mgr.capacity_mb()},
+            {"n_layers",        mgr.get_n_layers()},
+            {"n_expert",        mgr.get_n_expert()},
+            {"n_expert_used",   mgr.get_n_expert_used()},
+        };
+        res->ok(j);
         return res;
     };
 

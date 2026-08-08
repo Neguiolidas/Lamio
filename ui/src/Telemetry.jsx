@@ -16,7 +16,7 @@ function Bar({ value, max, color }) {
   )
 }
 
-export default function Telemetry({ stats, onRefresh, connected }) {
+export default function Telemetry({ stats, onRefresh, serverState }) {
   const hasData = stats && stats.hits !== undefined
   const total = hasData ? stats.hits + stats.misses : 0
   const hitRate = total > 0 ? ((stats.hits / total) * 100).toFixed(1) : '0.0'
@@ -30,12 +30,12 @@ export default function Telemetry({ stats, onRefresh, connected }) {
         </button>
       </div>
 
-      {!connected && (
-        <p style={styles.empty}>Server offline</p>
+      {serverState !== 'online' && (
+        <p style={styles.empty}>Server is {serverState}</p>
       )}
 
-      {connected && !hasData && (
-        <p style={styles.empty}>No telemetry yet. Run inference or click refresh.</p>
+      {serverState === 'online' && !hasData && (
+        <p style={styles.empty}>Tiering not enabled. Start server with --lamio-tier-budget.</p>
       )}
 
       {hasData && (

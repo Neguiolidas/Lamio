@@ -30,6 +30,7 @@ tier_manager::~tier_manager() {
 
 tier_manager::tier_manager(size_t ram_budget_bytes, int n_layers, int n_expert_per_layer)
     : n_expert(n_expert_per_layer)
+    , ram_budget(ram_budget_bytes)
 {
     caches.resize(n_layers);
     heat.resize(n_layers * n_expert * 3, 0);

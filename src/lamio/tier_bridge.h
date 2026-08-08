@@ -27,7 +27,7 @@ public:
     static tier_bridge & instance();
 
     bool init(const char * gguf_path, size_t ram_budget,
-              int n_layers, int n_expert);
+              int n_layers, int n_expert, int n_expert_used = 0);
 
     // Called from llama_model_loader for each expert tensor.
     // tensor_name: e.g. "blk.0.ffn_up_exps.weight"

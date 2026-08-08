@@ -1279,7 +1279,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         size_t budget_bytes = (size_t)params.lamio_tier_budget * 1024 * 1024;
         auto & bridge = lamio::tier_bridge::instance();
         if (bridge.init(ml.model_path.c_str(),
-                        budget_bytes, hparams.n_layer(), hparams.n_expert)) {
+                        budget_bytes, hparams.n_layer(), hparams.n_expert, hparams.n_expert_used)) {
             LLAMA_LOG_INFO("%s: lamio tiering enabled, budget = %d MiB\n",
                            __func__, params.lamio_tier_budget);
         } else {

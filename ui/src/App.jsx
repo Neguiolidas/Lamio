@@ -1,9 +1,7 @@
-import { useState, useRef, useCallback } from 'react'
-import Chat from './Chat'
+import { useState, useRef, useCallback, useEffect } from 'react'
 import Sidebar from './Sidebar'
+import Chat from './Chat'
 import Telemetry from './Telemetry'
-
-const API = '/v1/chat/completions'
 
 export default function App() {
   const [config, setConfig] = useState({
@@ -19,7 +17,9 @@ export default function App() {
     threads: 4,
     ctx: 2048,
   })
-  const [connected, setConnected] = useState(false)
+  const [serverState, setServerState] = useState('unknown')
+  const [modelState, setModelState] = useState('none')
+  const [availableModels, setAvailableModels] = useState([])
   const [tierStats, setTierStats] = useState(null)
   const [messages, setMessages] = useState([])
   const [streaming, setStreaming] = useState(false)
@@ -30,23 +30,57 @@ export default function App() {
       const r = await fetch('/v1/models')
       if (r.ok) {
         const d = await r.json()
-        setConnected(true)
-        if (d.data?.[0]?.id && !config.model) {
-          setConfig(c => ({ ...c, model: d.data[0].id }))
+        const models = d.data || []
+        setAvailableModels(models)
+        if (models.length > 0) {
+          setModelState('loaded')
+          if (!config.model) {
+            setConfig(c => ({ ...c, model: models[0].id }))
+          }
+        } else {
+          setModelState('empty')
         }
-      } else { setConnected(false) }
-    } catch { setConnected(false) }
+        setServerState('online')
+      } else if (r.status === 503) {
+        setServerState('loading')
+      } else {
+        setServerState('offline')
+      }
+    } catch {
+      setServerState('offline')
+    }
   }, [config.model])
+
+  useEffect(() => {
+    checkHealth()
+    const id = setInterval(checkHealth, 5000)
+    return () => clearInterval(id)
+  }, [checkHealth])
 
   const fetchTier = useCallback(async () => {
     try {
       const r = await fetch('/lamio/tier-stats')
-      if (r.ok) { const d = await r.json(); setTierStats(d) }
+      if (r.ok) {
+        const d = await r.json()
+        if (d.enabled) {
+          setTierStats(d)
+        } else {
+          setTierStats(null)
+        }
+      }
     } catch {}
   }, [])
 
+  useEffect(() => {
+    if (serverState === 'online') fetchTier()
+    const id = setInterval(() => {
+      if (serverState === 'online') fetchTier()
+    }, 3000)
+    return () => clearInterval(id)
+  }, [serverState, fetchTier])
+
   const send = useCallback(async (content) => {
-    if (streaming || !content.trim()) return
+    if (streaming || !content.trim() || modelState !== 'loaded') return
     const userMsg = { role: 'user', content }
     const next = [...messages, userMsg]
     setMessages(next)
@@ -59,7 +93,7 @@ export default function App() {
     abortRef.current = ctrl
 
     try {
-      const r = await fetch(API, {
+      const r = await fetch('/v1/chat/completions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -111,22 +145,19 @@ export default function App() {
       abortRef.current = null
       fetchTier()
     }
-  }, [messages, streaming, config, fetchTier])
+  }, [messages, streaming, config, modelState, fetchTier])
 
-  const stop = useCallback(() => {
-    abortRef.current?.abort()
-  }, [])
-
-  const clear = useCallback(() => {
-    setMessages([])
-  }, [])
+  const stop = useCallback(() => { abortRef.current?.abort() }, [])
+  const clear = useCallback(() => { setMessages([]) }, [])
 
   return (
     <div style={{ display: 'flex', height: '100vh', overflow: 'hidden' }}>
       <Sidebar
         config={config}
         setConfig={setConfig}
-        connected={connected}
+        serverState={serverState}
+        modelState={modelState}
+        availableModels={availableModels}
         onHealth={checkHealth}
         onTierFetch={fetchTier}
       />
@@ -136,12 +167,13 @@ export default function App() {
         onStop={stop}
         onClear={clear}
         streaming={streaming}
-        connected={connected}
+        serverState={serverState}
+        modelState={modelState}
       />
       <Telemetry
         stats={tierStats}
         onRefresh={fetchTier}
-        connected={connected}
+        serverState={serverState}
       />
     </div>
   )

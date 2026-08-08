@@ -5,8 +5,10 @@ export default defineConfig({
   plugins: [react()],
   server: {
     proxy: {
-      '/v1': 'http://localhost:8080',
-      '/lamio': 'http://localhost:8080'
+      '/v1': 'http://127.0.0.1:8090',
+      '/lamio': 'http://127.0.0.1:8090',
+      '/props': 'http://127.0.0.1:8090',
+      '/models': 'http://127.0.0.1:8090',
     }
   }
 })

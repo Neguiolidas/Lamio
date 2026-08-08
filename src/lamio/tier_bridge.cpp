@@ -8,13 +8,15 @@ tier_bridge & tier_bridge::instance() {
 }
 
 bool tier_bridge::init(const char * gguf_path, size_t ram_budget,
-                       int n_layers, int n_expert) {
+                       int n_layers, int n_expert, int n_expert_used) {
     if (!loader_.open(gguf_path)) {
         return false;
     }
 
-    // Create tier manager with budget
     manager_ = std::make_unique<tier_manager>(ram_budget, n_layers, n_expert);
+    if (n_expert_used > 0) {
+        manager_->set_n_expert_used(n_expert_used);
+    }
 
     manager_->set_load_callback([](int layer, int eid, int type_idx, void * dest, size_t size) -> bool {
         tier_bridge & self = instance();

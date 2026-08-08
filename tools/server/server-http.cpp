@@ -200,6 +200,7 @@ bool server_http_context::init(const common_params & params) {
             "/v1/health",
             "/models",
             "/v1/models",
+            "/lamio/tier-stats",
         };
         endpoints.insert(frontend_paths.begin(), frontend_paths.end());
         return endpoints;

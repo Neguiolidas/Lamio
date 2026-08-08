@@ -104,6 +104,17 @@ public:
     double total_load_time_ms() const { return stats_load_time_ms; }
     size_t total_bytes_loaded() const { return stats_bytes_loaded; }
 
+    double used_mb() const {
+        double total = 0;
+        for (const auto & lc : caches) total += lc.used_bytes;
+        return total / (1024.0 * 1024.0);
+    }
+    double capacity_mb() const { return ram_budget / (1024.0 * 1024.0); }
+    int    get_n_layers() const { return (int)caches.size(); }
+    int    get_n_expert() const { return n_expert; }
+    int    get_n_expert_used() const { return n_expert_used; }
+    void   set_n_expert_used(int k) { n_expert_used = k; }
+
     void print_stats() const;
 
     // Getters for cache data pointer (for bridge).
@@ -145,6 +156,8 @@ private:
     static constexpr int MAX_PENDING = 64;
 
     int n_expert;
+    int n_expert_used = 0;
+    size_t ram_budget = 0;
     int idx(int layer, int eid, int type_idx) const {
         return (layer * n_expert + eid) * 3 + type_idx;
     }
