@@ -16,6 +16,8 @@ export default function App() {
     ngl: 0,
     threads: 4,
     ctx: 2048,
+    reasoning_format: 'deepseek',
+    reasoning_effort: 'medium',
   })
   const [serverState, setServerState] = useState('unknown')
   const [modelState, setModelState] = useState('none')
@@ -23,6 +25,7 @@ export default function App() {
   const [tierStats, setTierStats] = useState(null)
   const [messages, setMessages] = useState([])
   const [streaming, setStreaming] = useState(false)
+  const [modelAction, setModelAction] = useState({ type: null, model: null })
   const abortRef = useRef(null)
 
   const checkHealth = useCallback(async () => {
@@ -79,6 +82,44 @@ export default function App() {
     return () => clearInterval(id)
   }, [serverState, fetchTier])
 
+  const loadModel = useCallback(async (modelId) => {
+    if (!modelId || modelAction.type) return
+    setModelAction({ type: 'load', model: modelId })
+    setServerState('loading')
+    try {
+      const r = await fetch('/models/load', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: modelId }),
+      })
+      if (!r.ok) throw new Error(`HTTP ${r.status}`)
+      await checkHealth()
+    } catch (e) {
+      console.error('loadModel failed:', e.message)
+      setServerState('offline')
+    } finally {
+      setModelAction({ type: null, model: null })
+    }
+  }, [modelAction, checkHealth])
+
+  const unloadModel = useCallback(async (modelId) => {
+    if (!modelId || modelAction.type) return
+    setModelAction({ type: 'unload', model: modelId })
+    try {
+      const r = await fetch('/models/unload', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: modelId }),
+      })
+      if (!r.ok) throw new Error(`HTTP ${r.status}`)
+      await checkHealth()
+    } catch (e) {
+      console.error('unloadModel failed:', e.message)
+    } finally {
+      setModelAction({ type: null, model: null })
+    }
+  }, [modelAction, checkHealth])
+
   const send = useCallback(async (content) => {
     if (streaming || !content.trim() || modelState !== 'loaded') return
     const userMsg = { role: 'user', content }
@@ -86,7 +127,7 @@ export default function App() {
     setMessages(next)
     setStreaming(true)
 
-    const assistantMsg = { role: 'assistant', content: '' }
+    const assistantMsg = { role: 'assistant', content: '', reasoning: '' }
     setMessages([...next, assistantMsg])
 
     const ctrl = new AbortController()
@@ -104,6 +145,8 @@ export default function App() {
           top_p: config.top_p,
           repeat_penalty: config.repeat_penalty,
           n_predict: config.n_predict,
+          reasoning_format: config.reasoning_format,
+          reasoning_effort: config.reasoning_effort,
           stream: true,
         }),
         signal: ctrl.signal,
@@ -114,6 +157,7 @@ export default function App() {
       const reader = r.body.getReader()
       const decoder = new TextDecoder()
       let buf = ''
+      let sawReasoning = false
 
       while (true) {
         const { done, value } = await reader.read()
@@ -127,11 +171,18 @@ export default function App() {
           if (data === '[DONE]') break
           try {
             const j = JSON.parse(data)
-            const tok = j.choices?.[0]?.delta?.content
+            const delta = j.choices?.[0]?.delta
+            if (!delta) continue
+            const tok = delta.content
+            const reasonTok = delta.reasoning_content || delta.reasoning
+            if (reasonTok) {
+              assistantMsg.reasoning += reasonTok
+              sawReasoning = true
+            }
             if (tok) {
               assistantMsg.content += tok
-              setMessages([...next, { ...assistantMsg }])
             }
+            setMessages([...next, { ...assistantMsg }])
           } catch {}
         }
       }
@@ -148,7 +199,17 @@ export default function App() {
   }, [messages, streaming, config, modelState, fetchTier])
 
   const stop = useCallback(() => { abortRef.current?.abort() }, [])
-  const clear = useCallback(() => { setMessages([]) }, [])
+
+  const newSession = useCallback(() => {
+    if (streaming) abortRef.current?.abort()
+    setMessages([])
+    // Tenta limpar o estado no servidor; ignora falhas pois o servidor trata cada request com contexto proprio
+    fetch('/v1/chat/completions/control', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cmd: 'clear' }),
+    }).catch(() => {})
+  }, [streaming])
 
   return (
     <div style={{ display: 'flex', height: '100vh', overflow: 'hidden' }}>
@@ -160,15 +221,20 @@ export default function App() {
         availableModels={availableModels}
         onHealth={checkHealth}
         onTierFetch={fetchTier}
+        onLoadModel={loadModel}
+        onUnloadModel={unloadModel}
+        modelAction={modelAction}
       />
       <Chat
         messages={messages}
         onSend={send}
         onStop={stop}
-        onClear={clear}
+        onNewSession={newSession}
         streaming={streaming}
         serverState={serverState}
         modelState={modelState}
+        ctx={config.ctx}
+        modelName={config.model}
       />
       <Telemetry
         stats={tierStats}

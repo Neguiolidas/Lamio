@@ -1,4 +1,4 @@
-export default function Sidebar({ config, setConfig, serverState, modelState, availableModels, onHealth, onTierFetch }) {
+export default function Sidebar({ config, setConfig, serverState, modelState, availableModels, onHealth, onTierFetch, onLoadModel, onUnloadModel, modelAction }) {
   const set = (k) => (e) => setConfig(c => ({ ...c, [k]: e.target.type === 'number' ? Number(e.target.value) : e.target.value }))
 
   const stateColor = {
@@ -13,6 +13,11 @@ export default function Sidebar({ config, setConfig, serverState, modelState, av
     empty: 'No model',
     none: 'No model',
   }
+
+  const isLoading = modelAction.type === 'load'
+  const isUnloading = modelAction.type === 'unload'
+  const modelInput = config.model.trim()
+  const modelInList = availableModels.some(m => m.id === modelInput)
 
   return (
     <div style={S.wrap}>
@@ -45,8 +50,42 @@ export default function Sidebar({ config, setConfig, serverState, modelState, av
           {availableModels.map(m => <option key={m.id} value={m.id}>{m.id}</option>)}
         </select>
       ) : (
-        <input value={config.model} onChange={set('model')} style={S.input} placeholder="no model loaded" />
+        <input value={config.model} onChange={set('model')} style={S.input} placeholder="model id" />
       )}
+
+      <div style={S.modelBtnRow}>
+        <button
+          onClick={() => onLoadModel(modelInput)}
+          disabled={!modelInput || isLoading || modelInList}
+          style={{ ...S.btn, ...S.modelBtn, opacity: (!modelInput || isLoading || modelInList) ? 0.5 : 1 }}
+        >
+          {isLoading ? 'Loading...' : 'Load model'}
+        </button>
+        <button
+          onClick={() => onUnloadModel(modelInput)}
+          disabled={!modelInput || isUnloading || !modelInList}
+          style={{ ...S.btn, ...S.modelBtn, opacity: (!modelInput || isUnloading || !modelInList) ? 0.5 : 1 }}
+        >
+          {isUnloading ? 'Unloading...' : 'Unload'}
+        </button>
+      </div>
+
+      <div style={S.divider} />
+
+      <h3 style={S.sectionTitle}>Reasoning</h3>
+      <label style={S.label}>Format</label>
+      <select value={config.reasoning_format} onChange={set('reasoning_format')} style={S.input}>
+        <option value="deepseek">deepseek</option>
+        <option value="deepseek-legacy">deepseek-legacy</option>
+        <option value="gpt-oss">gpt-oss</option>
+      </select>
+      <label style={S.label}>Effort</label>
+      <select value={config.reasoning_effort} onChange={set('reasoning_effort')} style={S.input}>
+        <option value="none">none</option>
+        <option value="low">low</option>
+        <option value="medium">medium</option>
+        <option value="high">high</option>
+      </select>
 
       <div style={S.divider} />
 
@@ -100,6 +139,8 @@ const S = {
   statusLabel: { fontSize: 11, color: '#5f6d80' },
   statusValue: { fontSize: 12, fontWeight: 600 },
   btn: { width: '100%', padding: '6px 0', fontSize: 12 },
+  modelBtnRow: { display: 'flex', gap: 4, marginTop: 4 },
+  modelBtn: { width: 'auto', flex: 1, padding: '6px 4px', fontSize: 11 },
   divider: { height: 1, background: '#1f2733', margin: '10px 0' },
   sectionTitle: { fontSize: 11, textTransform: 'uppercase', letterSpacing: 1, color: '#5f6d80', marginBottom: 6 },
   label: { fontSize: 11, color: '#5f6d80', marginTop: 6, display: 'block' },
