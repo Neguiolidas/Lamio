@@ -3,6 +3,9 @@ import Sidebar from './Sidebar'
 import Chat from './Chat'
 import Telemetry from './Telemetry'
 
+const REASONING_FORMATS = ['deepseek', 'deepseek-legacy', 'gpt-oss']
+const REASONING_EFFORTS = ['none', 'low', 'medium', 'high']
+
 export default function App() {
   const [config, setConfig] = useState({
     model: '',
@@ -11,17 +14,13 @@ export default function App() {
     top_p: 0.9,
     repeat_penalty: 1.1,
     n_predict: 256,
-    tier_budget: 4096,
-    expert_k: 0,
-    ngl: 0,
-    threads: 4,
-    ctx: 2048,
     reasoning_format: 'deepseek',
     reasoning_effort: 'medium',
   })
   const [serverState, setServerState] = useState('unknown')
-  const [modelState, setModelState] = useState('none')
+  const [modelStatus, setModelStatus] = useState({})
   const [availableModels, setAvailableModels] = useState([])
+  const [serverCtx, setServerCtx] = useState(null)
   const [tierStats, setTierStats] = useState(null)
   const [messages, setMessages] = useState([])
   const [streaming, setStreaming] = useState(false)
@@ -35,15 +34,24 @@ export default function App() {
         const d = await r.json()
         const models = d.data || []
         setAvailableModels(models)
-        if (models.length > 0) {
-          setModelState('loaded')
-          if (!config.model) {
-            setConfig(c => ({ ...c, model: models[0].id }))
-          }
-        } else {
-          setModelState('empty')
+
+        const status = {}
+        let hasLoaded = false
+        for (const m of models) {
+          const st = m.status?.value || m.status || 'unknown'
+          status[m.id] = st
+          if (st === 'loaded' || st === 'running') hasLoaded = true
         }
-        setServerState('online')
+        setModelStatus(status)
+        setServerState(hasLoaded ? 'online' : 'ready')
+
+        if (!config.model && models.length > 0) {
+          const first = models.find(m => !m.id.startsWith('ggml-vocab')) || models[0]
+          setConfig(c => ({ ...c, model: first.id }))
+        }
+
+        const ctx = models.find(m => m.id === config.model)?.meta?.n_ctx
+        if (ctx) setServerCtx(ctx)
       } else if (r.status === 503) {
         setServerState('loading')
       } else {
@@ -65,11 +73,7 @@ export default function App() {
       const r = await fetch('/lamio/tier-stats')
       if (r.ok) {
         const d = await r.json()
-        if (d.enabled) {
-          setTierStats(d)
-        } else {
-          setTierStats(null)
-        }
+        setTierStats(d.enabled ? d : null)
       }
     } catch {}
   }, [])
@@ -85,18 +89,20 @@ export default function App() {
   const loadModel = useCallback(async (modelId) => {
     if (!modelId || modelAction.type) return
     setModelAction({ type: 'load', model: modelId })
-    setServerState('loading')
     try {
       const r = await fetch('/models/load', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ model: modelId }),
       })
-      if (!r.ok) throw new Error(`HTTP ${r.status}`)
-      await checkHealth()
+      if (!r.ok) {
+        const e = await r.json().catch(() => ({}))
+        console.error('load failed:', e.error?.message || r.status)
+      } else {
+        setTimeout(checkHealth, 1000)
+      }
     } catch (e) {
-      console.error('loadModel failed:', e.message)
-      setServerState('offline')
+      console.error('loadModel:', e.message)
     } finally {
       setModelAction({ type: null, model: null })
     }
@@ -111,17 +117,24 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ model: modelId }),
       })
-      if (!r.ok) throw new Error(`HTTP ${r.status}`)
-      await checkHealth()
+      if (!r.ok) {
+        const e = await r.json().catch(() => ({}))
+        console.error('unload failed:', e.error?.message || r.status)
+      } else {
+        setTimeout(checkHealth, 1000)
+      }
     } catch (e) {
-      console.error('unloadModel failed:', e.message)
+      console.error('unloadModel:', e.message)
     } finally {
       setModelAction({ type: null, model: null })
     }
   }, [modelAction, checkHealth])
 
+  const currentModelStatus = modelStatus[config.model]
+  const modelReady = currentModelStatus === 'loaded' || currentModelStatus === 'running'
+
   const send = useCallback(async (content) => {
-    if (streaming || !content.trim() || modelState !== 'loaded') return
+    if (streaming || !content.trim() || !modelReady) return
     const userMsg = { role: 'user', content }
     const next = [...messages, userMsg]
     setMessages(next)
@@ -157,7 +170,6 @@ export default function App() {
       const reader = r.body.getReader()
       const decoder = new TextDecoder()
       let buf = ''
-      let sawReasoning = false
 
       while (true) {
         const { done, value } = await reader.read()
@@ -175,13 +187,8 @@ export default function App() {
             if (!delta) continue
             const tok = delta.content
             const reasonTok = delta.reasoning_content || delta.reasoning
-            if (reasonTok) {
-              assistantMsg.reasoning += reasonTok
-              sawReasoning = true
-            }
-            if (tok) {
-              assistantMsg.content += tok
-            }
+            if (reasonTok) assistantMsg.reasoning += reasonTok
+            if (tok) assistantMsg.content += tok
             setMessages([...next, { ...assistantMsg }])
           } catch {}
         }
@@ -196,19 +203,13 @@ export default function App() {
       abortRef.current = null
       fetchTier()
     }
-  }, [messages, streaming, config, modelState, fetchTier])
+  }, [messages, streaming, config, modelReady, fetchTier])
 
   const stop = useCallback(() => { abortRef.current?.abort() }, [])
 
   const newSession = useCallback(() => {
     if (streaming) abortRef.current?.abort()
     setMessages([])
-    // Tenta limpar o estado no servidor; ignora falhas pois o servidor trata cada request com contexto proprio
-    fetch('/v1/chat/completions/control', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ cmd: 'clear' }),
-    }).catch(() => {})
   }, [streaming])
 
   return (
@@ -217,13 +218,14 @@ export default function App() {
         config={config}
         setConfig={setConfig}
         serverState={serverState}
-        modelState={modelState}
+        modelStatus={modelStatus}
         availableModels={availableModels}
         onHealth={checkHealth}
         onTierFetch={fetchTier}
         onLoadModel={loadModel}
         onUnloadModel={unloadModel}
         modelAction={modelAction}
+        serverCtx={serverCtx}
       />
       <Chat
         messages={messages}
@@ -231,10 +233,10 @@ export default function App() {
         onStop={stop}
         onNewSession={newSession}
         streaming={streaming}
+        modelReady={modelReady}
         serverState={serverState}
-        modelState={modelState}
-        ctx={config.ctx}
         modelName={config.model}
+        serverCtx={serverCtx}
       />
       <Telemetry
         stats={tierStats}

@@ -1,14 +1,12 @@
 import { useState, useRef, useEffect } from 'react'
 
-export default function Chat({ messages, onSend, onStop, onNewSession, streaming, serverState, modelState, ctx, modelName }) {
+export default function Chat({ messages, onSend, onStop, onNewSession, streaming, modelReady, serverState, modelName, serverCtx }) {
   const [input, setInput] = useState('')
   const endRef = useRef(null)
 
-  useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages])
+  useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages])
 
-  const canChat = serverState === 'online' && modelState === 'loaded'
+  const canChat = modelReady && serverState !== 'offline'
 
   const submit = (e) => {
     e.preventDefault()
@@ -22,10 +20,10 @@ export default function Chat({ messages, onSend, onStop, onNewSession, streaming
   }
 
   const emptyMsg = () => {
-    if (serverState === 'offline') return 'Server is not running. Start llama-server and click Check server.'
-    if (serverState === 'loading') return 'Model is loading...'
-    if (serverState === 'unknown') return 'Click Check server to connect.'
-    if (modelState !== 'loaded') return 'No model loaded. Use the sidebar to load a model.'
+    if (serverState === 'offline') return 'Server offline. Start llama-server in router mode.'
+    if (serverState === 'ready') return 'Select a model and click Load.'
+    if (serverState === 'loading') return 'Model loading...'
+    if (!modelReady) return 'Model not loaded. Use Load in the sidebar.'
     return 'Start a conversation'
   }
 
@@ -33,10 +31,14 @@ export default function Chat({ messages, onSend, onStop, onNewSession, streaming
     <div style={S.wrap}>
       <div style={S.header}>
         <span style={S.headerModel}>{modelName || 'no model'}</span>
-        <span style={S.headerSep}>|</span>
-        <span style={S.headerCtx}>ctx {ctx ?? '-'}</span>
+        {serverCtx != null && (
+          <>
+            <span style={S.headerSep}>|</span>
+            <span style={S.headerCtx}>ctx {serverCtx}</span>
+          </>
+        )}
         <span style={{ flex: 1 }} />
-        <button onClick={onNewSession} style={S.newBtn} title="Clear messages and start a new session">New session</button>
+        <button onClick={onNewSession} style={S.newBtn}>New session</button>
       </div>
 
       <div style={S.messages}>
@@ -64,7 +66,7 @@ export default function Chat({ messages, onSend, onStop, onNewSession, streaming
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={handleKey}
-          placeholder={canChat ? 'Type a message...' : 'Waiting for model'}
+          placeholder={canChat ? 'Type a message... (Enter to send, Shift+Enter for newline)' : 'Waiting for model'}
           disabled={!canChat || streaming}
           style={S.textarea}
           rows={1}
@@ -75,22 +77,15 @@ export default function Chat({ messages, onSend, onStop, onNewSession, streaming
   )
 }
 
-// Bloco de raciocinio colapsavel, com estilo diferente do conteudo principal
 function ReasoningBlock({ text }) {
   const [open, setOpen] = useState(true)
   if (!text) return null
   return (
     <div style={S.reasoningWrap}>
-      <button
-        type="button"
-        onClick={() => setOpen(o => !o)}
-        style={S.reasoningToggle}
-      >
+      <button type="button" onClick={() => setOpen(o => !o)} style={S.reasoningToggle}>
         {open ? '[-]' : '[+]'} reasoning
       </button>
-      {open && (
-        <pre style={S.reasoningText}>{text}</pre>
-      )}
+      {open && <pre style={S.reasoningText}>{text}</pre>}
     </div>
   )
 }
@@ -98,7 +93,7 @@ function ReasoningBlock({ text }) {
 const S = {
   wrap: { flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 },
   header: { display: 'flex', alignItems: 'center', gap: 8, padding: '6px 12px', borderBottom: '1px solid #1f2733', background: '#131820', fontSize: 11 },
-  headerModel: { color: '#39baec', fontWeight: 600, fontFamily: '"SF Mono", "Cascadia Code", "Consolas", monospace', fontSize: 11, maxWidth: 240, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+  headerModel: { color: '#39baec', fontWeight: 600, fontFamily: '"SF Mono", "Cascadia Code", "Consolas", monospace', fontSize: 11, maxWidth: 280, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
   headerSep: { color: '#3a4a5e' },
   headerCtx: { color: '#5f6d80', fontFamily: '"SF Mono", "Cascadia Code", "Consolas", monospace', fontSize: 11 },
   newBtn: { padding: '4px 10px', fontSize: 11, whiteSpace: 'nowrap' },
