@@ -16,12 +16,9 @@ bool tier_bridge::init(const char * gguf_path, size_t ram_budget,
     // Create tier manager with budget
     manager_ = std::make_unique<tier_manager>(ram_budget, n_layers, n_expert);
 
-    // Set load callback: dispatch by (layer, eid) to load all 3 expert tensors.
-    // The type_idx encodes which tensor (0=up, 1=gate, 2=down) via high bits.
-    // tier_manager only tracks (layer, eid) pairs, so we load all 3 at once.
-    manager_->set_load_callback([](int layer, int eid, void * dest, size_t size) -> bool {
+    manager_->set_load_callback([](int layer, int eid, int type_idx, void * dest, size_t size) -> bool {
         tier_bridge & self = instance();
-        const expert_tensor_info * info = self.find_tensor_info(layer, 0); // 0 = up
+        const expert_tensor_info * info = self.find_tensor_info(layer, type_idx);
         if (!info) return false;
         size_t n = self.loader_.read_expert_slice(info->name.c_str(), eid,
                                                    info->expert_bytes,
@@ -54,14 +51,26 @@ void tier_bridge::register_expert_tensor(const char * tensor_name, int eid,
     tensor_infos_[key] = {tensor_name, expert_bytes, tensor_stride};
 }
 
-void tier_bridge::on_expert_select(int layer, const int * selected_experts, int k) {
+void tier_bridge::on_expert_select(int layer, int type_idx, const int * selected_experts, int k) {
     if (!enabled_ || !manager_) return;
-    manager_->on_select(layer, selected_experts, k);
+    manager_->on_select(layer, type_idx, selected_experts, k);
 }
 
-void * tier_bridge::get_expert_data(int layer, int eid) const {
+void * tier_bridge::get_expert_data(int layer, int eid, int type_idx) const {
     if (!enabled_ || !manager_) return nullptr;
-    return manager_->get_data(layer, eid);
+    return manager_->get_data(layer, eid, type_idx);
+}
+
+void tier_bridge::prefetch_layer(int layer, int type_idx,
+                                  const int * selected, int k, int next_layer) {
+    if (!enabled_) return;
+    for (int i = 0; i < k; i++) {
+        int eid = selected[i];
+        if (eid < 0) continue;
+        const expert_tensor_info * info = find_tensor_info(next_layer, type_idx);
+        if (!info) continue;
+        loader_.prefetch_expert(info->name.c_str(), eid, info->expert_bytes);
+    }
 }
 
 const tier_bridge::expert_tensor_info * tier_bridge::find_tensor_info(int layer, int type_idx) const {

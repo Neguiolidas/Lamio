@@ -9,8 +9,13 @@
 #include <vector>
 #include <map>
 #include <memory>
+#include <atomic>
 
 namespace lamio {
+
+// Global override for n_expert_used (0 = no override, use model default).
+// Set via --lamio-expert-k CLI flag.
+inline std::atomic<int> g_expert_k_override{0};
 
 // Bridge between llama.cpp model loader and lamio tier system.
 // During model load, expert tensors are registered but not allocated.
@@ -37,25 +42,26 @@ public:
 
     // Called from build_moe_ffn after top-k selection.
     // Loads the k selected experts into cache and patches tensor data pointers.
-    void on_expert_select(int layer, const int * selected_experts, int k);
+    void on_expert_select(int layer, int type_idx, const int * selected_experts, int k);
 
-    // Alias used by the eval callback
-    void on_select(int layer, const int * selected_experts, int k) {
-        on_expert_select(layer, selected_experts, k);
+    void on_select(int layer, int type_idx, const int * selected_experts, int k) {
+        on_expert_select(layer, type_idx, selected_experts, k);
     }
 
-    // Async select + wait
-    void on_select_async(int layer, const int * selected_experts, int k) {
+    void on_select_async(int layer, int type_idx, const int * selected_experts, int k) {
         if (!enabled_ || !manager_) return;
-        manager_->on_select_async(layer, selected_experts, k);
+        manager_->on_select_async(layer, type_idx, selected_experts, k);
     }
-    void wait_async(int layer, int eid) {
+    void wait_async(int layer, int eid, int type_idx) {
         if (!enabled_ || !manager_) return;
-        manager_->wait_async(layer, eid);
+        manager_->wait_async(layer, eid, type_idx);
     }
 
-    // Get pointer to cached data for an expert.
-    void * get_expert_data(int layer, int eid) const;
+    void * get_expert_data(int layer, int eid, int type_idx) const;
+
+    // Prefetch experts for the next layer into kernel page cache.
+    void prefetch_layer(int layer, int type_idx,
+                        const int * selected, int k, int next_layer);
 
     // Buffer management for expert weight tensors.
     // The eval callback needs to allocate a buffer for the full expert tensor

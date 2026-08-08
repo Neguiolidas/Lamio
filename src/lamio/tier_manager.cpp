@@ -1,8 +1,11 @@
 #include "tier_manager.h"
+#include <chrono>
+#include <cstdio>
 
 namespace lamio {
 
 tier_manager::~tier_manager() {
+    print_stats();
     for (auto & lc : caches) {
         for (auto & slot : lc.slots) {
             if (slot.data) {
@@ -29,68 +32,72 @@ tier_manager::tier_manager(size_t ram_budget_bytes, int n_layers, int n_expert_p
     : n_expert(n_expert_per_layer)
 {
     caches.resize(n_layers);
-    heat.resize(n_layers * n_expert, 0);
-    last.resize(n_layers * n_expert, 0);
+    heat.resize(n_layers * n_expert * 3, 0);
+    last.resize(n_layers * n_expert * 3, 0);
 
-    // Distribute budget evenly across layers
-    size_t per_layer = ram_budget_bytes / n_layers;
-    // per-layer capacity: enough for a few expert slots
-    // each slot is roughly the size of one expert tensor
-    for (auto & lc : caches) {
-        lc.capacity_bytes = per_layer;
-        lc.used_bytes = 0;
-        lc.slots.reserve(16);
+    // Distribute budget with shallow-favoring weights.
+    // Layers 0-9 get 2x weight, 10-19 get 1.5x, rest get 1x.
+    // This follows the observation that shallow layers are accessed first
+    // and have higher temporal locality.
+    std::vector<double> weights(n_layers, 1.0);
+    double total_weight = 0.0;
+    for (int i = 0; i < n_layers; i++) {
+        if (i < 10) weights[i] = 2.0;
+        else if (i < 20) weights[i] = 1.5;
+        total_weight += weights[i];
+    }
+    for (int i = 0; i < n_layers; i++) {
+        caches[i].capacity_bytes = (size_t)((double)ram_budget_bytes * weights[i] / total_weight);
+        caches[i].used_bytes = 0;
+        caches[i].slots.reserve(16);
     }
 }
 
-void tier_manager::register_expert(int layer, int eid,
+void tier_manager::register_expert(int layer, int eid, int type_idx,
                                     int64_t file_offset, size_t byte_size, int ggml_type) {
-    expert_key k{layer, eid};
+    expert_key k{layer, eid, type_idx};
     registry[k] = {file_offset, byte_size, ggml_type};
 }
 
-bool tier_manager::is_resident(int layer, int eid) const {
+bool tier_manager::is_resident(int layer, int eid, int type_idx) const {
     if (layer < 0 || layer >= (int)caches.size()) return false;
-    auto it = caches[layer].expert_to_slot.find(eid);
+    auto it = caches[layer].expert_to_slot.find({eid, type_idx});
     return it != caches[layer].expert_to_slot.end();
 }
 
-void tier_manager::bump_heat(int layer, int eid) {
-    int i = idx(layer, eid);
+void tier_manager::bump_heat(int layer, int eid, int type_idx) {
+    int i = idx(layer, eid, type_idx);
     if (heat[i] < UINT32_MAX) heat[i]++;
     last[i] = clock++;
 }
 
-void * tier_manager::get_data(int layer, int eid) const {
+void * tier_manager::get_data(int layer, int eid, int type_idx) const {
     if (layer < 0 || layer >= (int)caches.size()) return nullptr;
     auto & lc = caches[layer];
-    auto it = lc.expert_to_slot.find(eid);
+    auto it = lc.expert_to_slot.find({eid, type_idx});
     if (it == lc.expert_to_slot.end()) return nullptr;
     return lc.slots[it->second].data;
 }
 
-void tier_manager::ensure_slot(int layer, int eid) {
+void tier_manager::ensure_slot(int layer, int eid, int type_idx) {
     auto & lc = caches[layer];
-    // Already resident?
-    if (lc.expert_to_slot.find(eid) != lc.expert_to_slot.end()) {
-        bump_heat(layer, eid);
+    slot_key sk{eid, type_idx};
+    if (lc.expert_to_slot.find(sk) != lc.expert_to_slot.end()) {
+        bump_heat(layer, eid, type_idx);
         stats_hits++;
         return;
     }
 
-    // Find the record
-    expert_key k{layer, eid};
+    expert_key k{layer, eid, type_idx};
     auto rit = registry.find(k);
-    if (rit == registry.end()) return; // not in model (shouldn't happen)
+    if (rit == registry.end()) return;
 
-    // Make room if needed. Max 64 evicts to prevent infinite loop on tiny budget
     size_t needed = rit->second.byte_size;
     int max_evict = 64;
     while (lc.used_bytes + needed > lc.capacity_bytes && !lc.slots.empty() && max_evict-- > 0) {
         evict_one(layer);
     }
 
-    // Find an empty slot or reuse an evicted one
     int slot_idx = -1;
     for (int i = 0; i < (int)lc.slots.size(); i++) {
         if (!lc.slots[i].valid) { slot_idx = i; break; }
@@ -101,7 +108,6 @@ void tier_manager::ensure_slot(int layer, int eid) {
     }
 
     auto & slot = lc.slots[slot_idx];
-    // Allocate or reuse buffer
     if (slot.size < needed) {
         delete[] (uint8_t*)slot.data;
         slot.data = new uint8_t[needed];
@@ -110,19 +116,23 @@ void tier_manager::ensure_slot(int layer, int eid) {
 
     slot.layer      = layer;
     slot.expert_id  = eid;
+    slot.type_idx   = type_idx;
     slot.valid      = true;
     slot.heat       = 0;
     slot.last_access = 0;
 
-    // Load data
     if (load_cb) {
-        load_cb(layer, eid, slot.data, needed);
+        auto t0 = std::chrono::steady_clock::now();
+        load_cb(layer, eid, type_idx, slot.data, needed);
+        auto t1 = std::chrono::steady_clock::now();
+        stats_load_time_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+        stats_bytes_loaded += needed;
     }
 
-    lc.expert_to_slot[eid] = slot_idx;
+    lc.expert_to_slot[sk] = slot_idx;
     lc.used_bytes += needed;
 
-    bump_heat(layer, eid);
+    bump_heat(layer, eid, type_idx);
     stats_misses++;
 }
 
@@ -143,7 +153,8 @@ void tier_manager::evict_one(int layer) {
     for (int i = 0; i < (int)pinned.size(); i++) {
         int si = pinned[i];
         int eid = lc.slots[si].expert_id;
-        int hi = idx(layer, eid);
+        int tid = lc.slots[si].type_idx;
+        int hi = idx(layer, eid, tid);
         slot_heat[i] = heat[hi];
         slot_last[i] = last[hi];
     }
@@ -161,38 +172,36 @@ void tier_manager::evict_one(int layer) {
     if (!slot.valid) return;
 
     // Remove from map
-    lc.expert_to_slot.erase(slot.expert_id);
+    lc.expert_to_slot.erase({slot.expert_id, slot.type_idx});
     lc.used_bytes -= slot.size;
     slot.valid = false;
+    stats_evictions++;
 }
 
-void tier_manager::on_select(int layer, const int * selected_experts, int k) {
+void tier_manager::on_select(int layer, int type_idx, const int * selected_experts, int k) {
     for (int i = 0; i < k; i++) {
         int eid = selected_experts[i];
         if (eid < 0) continue;
-        ensure_slot(layer, eid);
+        ensure_slot(layer, eid, type_idx);
     }
 }
 
-void tier_manager::on_select_async(int layer, const int * selected_experts, int k) {
+void tier_manager::on_select_async(int layer, int type_idx, const int * selected_experts, int k) {
     std::lock_guard<std::mutex> lk(pending_mtx_);
     for (int i = 0; i < k; i++) {
         int eid = selected_experts[i];
         if (eid < 0) continue;
 
-        // Already resident? skip
-        if (is_resident(layer, eid)) {
-            bump_heat(layer, eid);
+        if (is_resident(layer, eid, type_idx)) {
+            bump_heat(layer, eid, type_idx);
             stats_hits++;
             continue;
         }
 
-        // Find record for size
-        expert_key key{layer, eid};
+        expert_key key{layer, eid, type_idx};
         auto rit = registry.find(key);
         if (rit == registry.end()) continue;
 
-        // Evict to make room (synchronous, fast)
         auto & lc = caches[layer];
         size_t needed = rit->second.byte_size;
         int max_evict = 64;
@@ -200,7 +209,6 @@ void tier_manager::on_select_async(int layer, const int * selected_experts, int 
             evict_one(layer);
         }
 
-        // Find or create slot
         int slot_idx = -1;
         for (int j = 0; j < (int)lc.slots.size(); j++) {
             if (!lc.slots[j].valid) { slot_idx = j; break; }
@@ -218,31 +226,31 @@ void tier_manager::on_select_async(int layer, const int * selected_experts, int 
         }
         slot.layer = layer;
         slot.expert_id = eid;
+        slot.type_idx = type_idx;
         slot.valid = true;
         slot.heat = 0;
         slot.last_access = 0;
-        lc.expert_to_slot[eid] = slot_idx;
+        lc.expert_to_slot[{eid, type_idx}] = slot_idx;
         lc.used_bytes += needed;
 
-        // Async pread: launch load_cb in a future
         void * dest = slot.data;
         size_t sz = needed;
         load_fn cb = load_cb;
         pending_loads_.push_back({std::async(std::launch::async,
-            [cb, layer, eid, dest, sz]() -> bool {
-                return cb(layer, eid, dest, sz);
-            }), layer, eid});
+            [cb, layer, eid, type_idx, dest, sz]() -> bool {
+                return cb(layer, eid, type_idx, dest, sz);
+            }), layer, eid, type_idx});
 
         stats_misses++;
     }
 }
 
-void tier_manager::wait_async(int layer, int eid) {
+void tier_manager::wait_async(int layer, int eid, int type_idx) {
     std::lock_guard<std::mutex> lk(pending_mtx_);
     for (auto it = pending_loads_.begin(); it != pending_loads_.end(); ++it) {
-        if (it->layer == layer && it->eid == eid) {
+        if (it->layer == layer && it->eid == eid && it->type_idx == type_idx) {
             it->fut.wait();
-            bump_heat(layer, eid);
+            bump_heat(layer, eid, type_idx);
             pending_loads_.erase(it);
             return;
         }
@@ -277,6 +285,23 @@ int tier_manager::get_slot_expert_id(int layer, int slot_idx) const {
     auto & lc = caches[layer];
     if (slot_idx < 0 || slot_idx >= (int)lc.slots.size()) return -1;
     return lc.slots[slot_idx].expert_id;
+}
+
+void tier_manager::print_stats() const {
+    int total = stats_hits + stats_misses;
+    double hit_rate = total > 0 ? 100.0 * stats_hits / total : 0.0;
+    fprintf(stderr, "lamio tier stats:"
+           " hits=%d misses=%d evictions=%d"
+           " hit_rate=%.1f%%"
+           " bytes_loaded=%.2f MB"
+           " load_time=%.1f ms"
+           " used=%.2f MB capacity=%.2f MB\n",
+           stats_hits, stats_misses, stats_evictions,
+           hit_rate,
+           stats_bytes_loaded / 1048576.0,
+           stats_load_time_ms,
+           total_used_bytes() / 1048576.0,
+           total_capacity_bytes() / 1048576.0);
 }
 
 } // namespace lamio

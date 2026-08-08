@@ -7,10 +7,6 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
-#include <set>
-#include <sys/mman.h>
-#include <cstdint>
-#include <unistd.h>
 
 namespace lamio {
 
@@ -47,6 +43,13 @@ bool lamio_eval_callback(ggml_tensor * t, bool ask, void * user_data) {
     int layer = extract_layer(ggml_get_name(weights));
     if (layer < 0) return true;
 
+    int type_idx = -1;
+    const char * wname = ggml_get_name(weights);
+    if (strstr(wname, "ffn_up_exps"))       type_idx = 0;
+    else if (strstr(wname, "ffn_gate_exps")) type_idx = 1;
+    else if (strstr(wname, "ffn_down_exps")) type_idx = 2;
+    if (type_idx < 0) return true;
+
     // Read selected expert IDs from the ids tensor (I32 type)
     // Layout: [n_expert_used, n_tokens], column-major
     const int n_expert_used = (int)ids->ne[0];
@@ -73,24 +76,12 @@ bool lamio_eval_callback(ggml_tensor * t, bool ask, void * user_data) {
 
     if (n_selected == 0) return true;
 
-    const size_t expert_stride = weights->nb[2];
-    const size_t expert_size   = ggml_nbytes(weights) / weights->ne[2];
+    bridge.on_select(layer, type_idx, selected, n_selected);
 
-    // Phase 2+3: WILLNEED prefetch on selected expert pages.
-    // DONTNEED is already done once at load time (phase 2).
-    // The kernel readahead pulls in the selected expert pages async.
-    for (int i = 0; i < n_selected; i++) {
-        int eid = selected[i];
-        if (eid < 0) continue;
-        void * page = (uint8_t *)weights->data + eid * expert_stride;
-        size_t page_size = 4096;
-        uintptr_t start = (uintptr_t)page;
-        uintptr_t end = start + expert_size;
-        start &= ~(page_size - 1);
-        end = (end + page_size - 1) & ~(page_size - 1);
-        if (end > start) {
-            madvise((void *)start, end - start, MADV_WILLNEED);
-        }
+    // Prefetch same experts for next layer (heuristic: correlated routing).
+    int n_layers = bridge.manager().n_layers();
+    if (layer + 1 < n_layers) {
+        bridge.prefetch_layer(layer, type_idx, selected, n_selected, layer + 1);
     }
 
     return true;

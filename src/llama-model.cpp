@@ -1092,6 +1092,15 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     GGML_ASSERT(hparams.n_layer_all > 0 && hparams.n_layer_all <= LLAMA_MAX_LAYERS);
     ml.get_key(LLM_KV_EXPERT_COUNT,            hparams.n_expert,        false);
     ml.get_key(LLM_KV_EXPERT_USED_COUNT,       hparams.n_expert_used,   false);
+
+    // Lamio: override n_expert_used if --lamio-expert-k is set
+    {
+        int k_override = lamio::g_expert_k_override.load();
+        if (k_override > 0 && (uint32_t)k_override <= hparams.n_expert && k_override != (int)hparams.n_expert_used) {
+            LLAMA_LOG_INFO("%s: lamio: overriding n_expert_used %u -> %d\n", __func__, hparams.n_expert_used, k_override);
+            hparams.n_expert_used = k_override;
+        }
+    }
     ml.get_key(LLM_KV_EXPERT_GROUP_COUNT,      hparams.n_expert_groups, false);
     ml.get_key(LLM_KV_EXPERT_GROUP_USED_COUNT, hparams.n_group_used,    false);
 

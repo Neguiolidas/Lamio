@@ -1529,15 +1529,11 @@ bool llama_model_loader::load_all_data(
         if (lamio::tier_bridge::is_expert_tensor(ggml_get_name(cur))) {
             auto & bridge = lamio::tier_bridge::instance();
             if (bridge.is_enabled()) {
-                // Register the tensor info for later lazy loading
-                size_t expert_bytes = ggml_nbytes(cur) / cur->ne[2]; // one expert slice
+                size_t expert_bytes = ggml_nbytes(cur) / cur->ne[2];
                 size_t tensor_stride = expert_bytes;
                 bridge.register_expert_tensor(ggml_get_name(cur), 0,
                                                tensor_stride, expert_bytes);
-                LLAMA_LOG_DEBUG("%s: lamio tiering: skipped expert tensor %s (%zu bytes)\n",
-                                __func__, ggml_get_name(cur), ggml_nbytes(cur));
 
-                // Allocate backend buffer for the tensor (data will be filled by eval callback)
                 size_t n_size = ggml_nbytes(cur);
                 if (use_mmap && cur->data == nullptr) {
                     const auto & mapping = mappings.at(weight->idx);
@@ -1547,25 +1543,6 @@ bool llama_model_loader::load_all_data(
                     }
                     GGML_ASSERT(buf_mmap);
                     ggml_backend_tensor_alloc(buf_mmap, cur, (uint8_t *) mapping->addr() + weight->offs);
-                }
-
-                // Phase 2: DONTNEED on the entire expert tensor after allocation.
-                // The mmap pages are loaded during file mapping but we don't need
-                // them in RAM until the eval callback selects them. The kernel
-                // will re-fault them on demand when WILLNEED or first access.
-                if (cur->data) {
-                    size_t page_size = 4096;
-                    uintptr_t start = (uintptr_t)cur->data;
-                    uintptr_t end = start + n_size;
-                    start &= ~(page_size - 1);
-                    end = (end + page_size - 1) & ~(page_size - 1);
-                    if (end > start) {
-                        madvise((void *)start, end - start, MADV_DONTNEED);
-                    }
-                    size_t total_evicted = ggml_nbytes(cur);
-                    LLAMA_LOG_DEBUG("%s: lamio: DONTNEED expert tensor %s (%zu MB, total evicted %zu MB)\n",
-                                    __func__, ggml_get_name(cur), n_size / 1024 / 1024,
-                                    total_evicted / 1024 / 1024);
                 }
 
                 size_done += n_size;

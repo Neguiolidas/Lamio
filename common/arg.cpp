@@ -10,6 +10,7 @@
 #include "sampling.h"
 #include "speculative.h"
 #include "preset.h"
+#include "lamio/tier_bridge.h"
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -2671,6 +2672,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.lamio_tier_budget = std::stoi(value);
         }
     ));
+    add_opt(common_arg(
+        {"-lek", "--lamio-expert-k"}, "N",
+        "Lamio: override number of active experts per token (0 = use model default)\n",
+        [](common_params & params, const std::string & value) {
+            params.lamio_expert_k = std::stoi(value);
+            lamio::g_expert_k_override.store(std::stoi(value));
+        }
+    ).set_env("LLAMA_ARG_LAMIO_EXPERT_K"));
     add_opt(common_arg(
         {"-sm", "--split-mode"}, "{none,layer,row,tensor}",
         "how to split the model across multiple GPUs, one of:\n"

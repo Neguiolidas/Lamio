@@ -13,20 +13,22 @@ namespace lamio {
 struct expert_key {
     int layer;
     int expert_id;
+    int type_idx; // 0=up, 1=gate, 2=down
     bool operator==(const expert_key & o) const {
-        return layer == o.layer && expert_id == o.expert_id;
+        return layer == o.layer && expert_id == o.expert_id && type_idx == o.type_idx;
     }
 };
 
 struct expert_key_hash {
     size_t operator()(const expert_key & k) const {
-        return (size_t(k.layer) << 32) | size_t(k.expert_id);
+        return (size_t(k.layer) << 34) | (size_t(k.type_idx) << 32) | size_t(k.expert_id);
     }
 };
 
 struct cache_slot {
     int layer     = -1;
     int expert_id = -1;
+    int type_idx  = -1; // 0=up, 1=gate, 2=down
     void * data   = nullptr;
     size_t size   = 0;
     uint32_t heat = 0;
@@ -34,9 +36,23 @@ struct cache_slot {
     bool valid    = false;
 };
 
+struct slot_key {
+    int expert_id;
+    int type_idx;
+    bool operator==(const slot_key & o) const {
+        return expert_id == o.expert_id && type_idx == o.type_idx;
+    }
+};
+
+struct slot_key_hash {
+    size_t operator()(const slot_key & k) const {
+        return (size_t(k.type_idx) << 16) | size_t(k.expert_id);
+    }
+};
+
 struct layer_cache {
     std::vector<cache_slot> slots;
-    std::unordered_map<int, int> expert_to_slot; // eid -> slot index
+    std::unordered_map<slot_key, int, slot_key_hash> expert_to_slot;
     size_t capacity_bytes = 0;
     size_t used_bytes     = 0;
 };
@@ -54,28 +70,24 @@ public:
     tier_manager(size_t ram_budget_bytes, int n_layers, int n_expert_per_layer);
 
     // Register an expert tensor location in the GGUF file.
-    // Called during model load for each ffn_*_exps tensor.
-    void register_expert(int layer, int eid,
+    void register_expert(int layer, int eid, int type_idx,
                          int64_t file_offset, size_t byte_size, int ggml_type);
 
-    // Ensure selected experts are resident. Evicts cold ones if cache is full.
-    // Called after router selects top-k experts, before mul_mat_id.
-    void on_select(int layer, const int * selected_experts, int k);
+    // Ensure selected experts are resident for a given tensor type.
+    void on_select(int layer, int type_idx, const int * selected_experts, int k);
 
-    // Async version: kicks off pread for all selected experts, returns immediately.
-    // Call wait_async() before get_data().
-    void on_select_async(int layer, const int * selected_experts, int k);
-    void wait_async(int layer, int eid);
+    // Async version for a given tensor type.
+    void on_select_async(int layer, int type_idx, const int * selected_experts, int k);
+    void wait_async(int layer, int eid, int type_idx);
 
     // Bump heat for a resident expert.
-    void bump_heat(int layer, int eid);
+    void bump_heat(int layer, int eid, int type_idx);
 
-    // Check if an expert is cached.
-    bool is_resident(int layer, int eid) const;
+    // Check if an expert tensor is cached.
+    bool is_resident(int layer, int eid, int type_idx) const;
 
-    // Get pointer to cached data for an expert (layer, eid).
-    // Returns nullptr if not resident.
-    void * get_data(int layer, int eid) const;
+    // Get pointer to cached data for an expert tensor.
+    void * get_data(int layer, int eid, int type_idx) const;
 
     // Decay all heat counters (called periodically, e.g. every N tokens).
     void decay_all();
@@ -88,15 +100,18 @@ public:
     size_t total_capacity_bytes() const;
     int    total_hits() const { return stats_hits; }
     int    total_misses() const { return stats_misses; }
+    int    total_evictions() const { return stats_evictions; }
+    double total_load_time_ms() const { return stats_load_time_ms; }
+    size_t total_bytes_loaded() const { return stats_bytes_loaded; }
+
+    void print_stats() const;
 
     // Getters for cache data pointer (for bridge).
     void ** get_slot_data_ptr(int layer, int slot_idx);
     int get_slot_expert_id(int layer, int slot_idx) const;
 
-    // Set external load callback: function that reads expert data from disk.
-    // Called after eviction makes room, but before returning from on_select.
-    // Signature: bool(int layer, int eid, void * dest_buf, size_t size).
-    using load_fn = bool (*)(int layer, int eid, void * dest, size_t size);
+    // Set external load callback.
+    using load_fn = bool (*)(int layer, int eid, int type_idx, void * dest, size_t size);
     void set_load_callback(load_fn fn) { load_cb = fn; }
 
     ~tier_manager();
@@ -107,28 +122,33 @@ public:
 private:
     std::vector<layer_cache> caches;
     std::unordered_map<expert_key, expert_record, expert_key_hash> registry;
-    std::vector<uint32_t> heat;  // flattened: [layer][eid]
-    std::vector<uint32_t> last;  // flattened: [layer][eid]
+    std::vector<uint32_t> heat;  // flattened: [layer][eid*3+type_idx]
+    std::vector<uint32_t> last;  // flattened: [layer][eid*3+type_idx]
     uint32_t clock = 1;
     load_fn load_cb = nullptr;
     bool prefetch_enabled = false;
 
     int stats_hits   = 0;
     int stats_misses = 0;
+    int stats_evictions = 0;
+    double stats_load_time_ms = 0.0;
+    size_t stats_bytes_loaded = 0;
 
-    // Async loading: pending futures for each (layer, eid)
     struct pending_load {
         std::future<bool> fut;
         int layer;
         int eid;
+        int type_idx;
     };
     std::vector<pending_load> pending_loads_;
     std::mutex pending_mtx_;
     static constexpr int MAX_PENDING = 64;
 
     int n_expert;
-    int idx(int layer, int eid) const { return layer * n_expert + eid; }
-    void ensure_slot(int layer, int eid);
+    int idx(int layer, int eid, int type_idx) const {
+        return (layer * n_expert + eid) * 3 + type_idx;
+    }
+    void ensure_slot(int layer, int eid, int type_idx);
     void evict_one(int layer);
 };
 
