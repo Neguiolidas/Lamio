@@ -1,0 +1,57 @@
+:root {
+  --bg: #0a0e14;
+  --bg-panel: #131820;
+  --bg-input: #0d1117;
+  --border: #1f2733;
+  --border-hi: #2d3b4f;
+  --accent: #39baec;
+  --accent-hi: #5cc8f5;
+  --green: #50a14f;
+  --green-hi: #6fc46e;
+  --red: #f07178;
+  --yellow: #ffb454;
+  --text: #c5cdd8;
+  --text-dim: #5f6d80;
+  --radius: 6px;
+  --mono: "SF Mono", "Cascadia Code", "Consolas", monospace;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  overflow: hidden;
+  height: 100vh;
+}
+
+#root { height: 100vh; display: flex; flex-direction: column; }
+
+button {
+  background: var(--border);
+  color: var(--accent);
+  border: 1px solid var(--border-hi);
+  border-radius: var(--radius);
+  padding: 6px 14px;
+  cursor: pointer;
+  font-size: 13px;
+  transition: all 0.15s;
+}
+button:hover {
+  background: var(--border-hi);
+  color: var(--accent-hi);
+}
+
+input, select, textarea {
+  background: var(--bg-input);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 6px 10px;
+  font-size: 13px;
+  outline: none;
+}
+input:focus, select:focus { border-color: var(--accent); }
