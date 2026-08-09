@@ -4,13 +4,7 @@
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-LLAMA_DIR="$SCRIPT_DIR/llama.cpp"
-
-if [ ! -d "$LLAMA_DIR" ]; then
-    echo "Erro: pasta llama.cpp nao encontrada em $LLAMA_DIR"
-    echo "Rode: git clone --recurse-submodules https://github.com/Neguiolidas/Lamio.git"
-    exit 1
-fi
+LLAMA_DIR="$SCRIPT_DIR"
 
 cd "$LLAMA_DIR"
 
@@ -33,13 +27,19 @@ echo "Compilando (isso pode demorar varios minutos)..."
 cmake --build build -j 2>&1 | tail -10
 
 # Verificar resultado
-if [ -f "build/bin/llama-server" ]; then
-    SERVER="build/bin/llama-server"
-elif [ -f "build/bin/Release/llama-server" ]; then
-    SERVER="build/bin/Release/llama-server"
-elif [ -f "build/bin/Release/llama-server.exe" ]; then
-    SERVER="build/bin/Release/llama-server.exe"
-else
+SERVER=""
+for candidate in \
+    "build/bin/llama-server" \
+    "build/bin/Release/llama-server" \
+    "build/bin/Release/llama-server.exe" \
+    "build/bin/llama-server.exe"; do
+    if [ -f "$candidate" ]; then
+        SERVER="$candidate"
+        break
+    fi
+done
+
+if [ -z "$SERVER" ]; then
     echo ""
     echo "Erro: llama-server nao encontrado apos compilacao."
     echo "Verifique os erros acima."

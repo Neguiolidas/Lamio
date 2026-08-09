@@ -4,7 +4,7 @@
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-LLAMA_DIR="$SCRIPT_DIR/llama.cpp"
+LLAMA_DIR="$SCRIPT_DIR"
 
 # Encontrar o binario
 SERVER=""
@@ -13,7 +13,7 @@ for candidate in \
     "$LLAMA_DIR/build/bin/Release/llama-server" \
     "$LLAMA_DIR/build/bin/Release/llama-server.exe" \
     "$LLAMA_DIR/build/bin/llama-server.exe"; do
-    if [ -x "$candidate" ] || [ -f "$candidate" ]; then
+    if [ -f "$candidate" ]; then
         SERVER="$candidate"
         break
     fi
@@ -26,7 +26,8 @@ if [ -z "$SERVER" ]; then
 fi
 
 # Criar pasta de modelos se nao existir
-mkdir -p "$LLAMA_DIR/models"
+MODELS_DIR="${LAMIO_MODELS_DIR:-$LLAMA_DIR/models}"
+mkdir -p "$MODELS_DIR"
 
 # Configuracao padrao
 PORT="${LAMIO_PORT:-8090}"
@@ -44,13 +45,13 @@ echo "GPU layers: $NGL"
 echo "Tier budget: $TIER_BUDGET MiB"
 echo "Expert top-K: $EXPERT_K"
 echo ""
-echo "Modelos em: $LLAMA_DIR/models/"
+echo "Modelos em: $MODELS_DIR/"
 echo "Acesse: http://localhost:$PORT"
 echo "Pressione Ctrl+C para parar."
 echo ""
 
 exec "$SERVER" \
-    --models-dir "$LLAMA_DIR/models" \
+    --models-dir "$MODELS_DIR" \
     --port "$PORT" \
     --host 127.0.0.1 \
     -c "$CTX" \

@@ -2,19 +2,19 @@
 REM Subir o servidor Lamio
 REM Uso: start.bat
 
-set "LLAMA_DIR=%~dp0llama.cpp"
-set "MODELS_DIR=%LLAMA_DIR%\models"
+cd /d "%~dp0"
+set "MODELS_DIR=%CD%\models"
 
 REM Encontrar o binario
 set "SERVER="
-if exist "%LLAMA_DIR%\build\bin\Release\llama-server.exe" (
-    set "SERVER=%LLAMA_DIR%\build\bin\Release\llama-server.exe"
-) else if exist "%LLAMA_DIR%\build\bin\Release\llama-server" (
-    set "SERVER=%LLAMA_DIR%\build\bin\Release\llama-server"
-) else if exist "%LLAMA_DIR%\build\bin\llama-server.exe" (
-    set "SERVER=%LLAMA_DIR%\build\bin\llama-server.exe"
-) else if exist "%LLAMA_DIR%\build\bin\llama-server" (
-    set "SERVER=%LLAMA_DIR%\build\bin\llama-server"
+if exist "build\bin\Release\llama-server.exe" (
+    set "SERVER=%CD%\build\bin\Release\llama-server.exe"
+) else if exist "build\bin\Release\llama-server" (
+    set "SERVER=%CD%\build\bin\Release\llama-server"
+) else if exist "build\bin\llama-server.exe" (
+    set "SERVER=%CD%\build\bin\llama-server.exe"
+) else if exist "build\bin\llama-server" (
+    set "SERVER=%CD%\build\bin\llama-server"
 )
 
 if "%SERVER%"=="" (

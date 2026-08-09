@@ -8,16 +8,7 @@ echo   LAMIO - Build
 echo  ==========================================
 echo.
 
-set "LLAMA_DIR=%~dp0llama.cpp"
-
-if not exist "%LLAMA_DIR%\CMakeLists.txt" (
-    echo  Erro: llama.cpp nao encontrado em %LLAMA_DIR%
-    echo  Rode: git clone --recurse-submodules https://github.com/Neguiolidas/Lamio.git
-    pause
-    exit /b 1
-)
-
-cd /d "%LLAMA_DIR%"
+cd /d "%~dp0"
 
 REM Detectar CUDA
 where nvcc >nul 2>&1
