@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
 # Build do Lamio. Roda em Linux, Git Bash e WSL.
-# Uso: bash build.sh
+# Compila apenas o llama-server (nao o projeto inteiro) com jobs limitados.
+# Uso: bash build.sh  |  NOJOBS=2 bash build.sh
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-LLAMA_DIR="$SCRIPT_DIR"
+cd "$SCRIPT_DIR"
 
-cd "$LLAMA_DIR"
+# Limit jobs to avoid OOM on low-RAM boxes.
+CORES=$(nproc 2>/dev/null || echo 4)
+JOBS="${NOJOBS:-$(( CORES > 2 ? CORES / 2 : 1 ))}"
 
-# Detectar CUDA
+# Detect CUDA
 CUDA_ARGS=""
 if command -v nvcc >/dev/null 2>&1; then
     echo "CUDA detectado: $(nvcc --version 2>&1 | grep release | head -1)"
@@ -19,14 +22,14 @@ else
 fi
 
 echo ""
-echo "Configurando build..."
+echo "Configurando build (jobs=${JOBS})..."
 cmake -B build -S . $CUDA_ARGS 2>&1 | tail -5
 
 echo ""
-echo "Compilando (isso pode demorar varios minutos)..."
-cmake --build build -j 2>&1 | tail -10
+echo "Compilando llama-server (jobs=${JOBS}, isso pode demorar)..."
+cmake --build build -j"$JOBS" --target llama-server 2>&1 | tail -12
 
-# Verificar resultado
+# Find the binary
 SERVER=""
 for candidate in \
     "build/bin/llama-server" \
@@ -42,7 +45,7 @@ done
 if [ -z "$SERVER" ]; then
     echo ""
     echo "Erro: llama-server nao encontrado apos compilacao."
-    echo "Verifique os erros acima."
+    echo "Veja os erros acima."
     exit 1
 fi
 
@@ -51,7 +54,7 @@ echo "Build concluido com sucesso."
 echo "  Servidor: $SERVER"
 echo ""
 
-# Verificar se Lamio foi incluido
+# Verify Lamio flags were compiled in
 if "$SERVER" --help 2>&1 | grep -q 'lamio-tier-budget'; then
     echo "  Lamio tiering: OK"
 else
@@ -59,5 +62,4 @@ else
 fi
 
 echo ""
-echo "Para subir o servidor, rode:"
-echo "  bash start.sh"
+echo "Para subir o servidor: bash start.sh"

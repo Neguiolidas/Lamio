@@ -1,5 +1,6 @@
 @echo off
 REM Build do Lamio para Windows
+REM Compila apenas o llama-server, com jobs limitados para evitar travamento em maquinas fracas.
 REM Uso: build.bat
 
 echo.
@@ -31,8 +32,8 @@ if %errorlevel% neq 0 (
 )
 
 echo.
-echo  Compilando (pode demorar varios minutos)...
-cmake --build build --config Release -j
+echo  Compilando llama-server (pode demorar varios minutos)...
+cmake --build build --config Release --target llama-server -j
 if %errorlevel% neq 0 (
     echo  Erro na compilacao.
     pause
