@@ -1,6 +1,6 @@
 # Changelog
 
-## [3.0.0] - 2026-08-08
+## [0.3] - 2026-08-08
 
 Standalone fork of llama.cpp with MoE expert tiering.
 
