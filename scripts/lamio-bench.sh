@@ -29,7 +29,7 @@ run_bench() {
       -m "$MODEL" -p "$PROMPT" -n "$N_TOKENS" \
       -t "$THREADS" -ngl "$NGL" -c "$CTX" \
       --no-display-prompt --cache-type-k q4_0 --cache-type-v q4_0 \
-      -fa auto --simple-io "$@" >"$out_file" 2>&1
+      -fa auto --simple-io -st "$@" >"$out_file" 2>&1
     exit_code=$?
   else
     echo "Aviso: o comando timeout não está disponível; o teste não terá limite." >&2
@@ -37,7 +37,7 @@ run_bench() {
       -m "$MODEL" -p "$PROMPT" -n "$N_TOKENS" \
       -t "$THREADS" -ngl "$NGL" -c "$CTX" \
       --no-display-prompt --cache-type-k q4_0 --cache-type-v q4_0 \
-      -fa auto --simple-io "$@" >"$out_file" 2>&1
+      -fa auto --simple-io -st "$@" >"$out_file" 2>&1
     exit_code=$?
   fi
 
