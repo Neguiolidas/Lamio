@@ -109,11 +109,6 @@ void tier_manager::ensure_slot(int layer, int eid, int type_idx) {
     }
 
     auto & slot = lc.slots[slot_idx];
-    if (slot.size < needed) {
-        delete[] (uint8_t*)slot.data;
-        slot.data = new uint8_t[needed];
-        slot.size = needed;
-    }
 
     slot.layer      = layer;
     slot.expert_id  = eid;
@@ -122,9 +117,17 @@ void tier_manager::ensure_slot(int layer, int eid, int type_idx) {
     slot.heat       = 0;
     slot.last_access = 0;
 
-    if (load_cb) {
+    // No dedicated RAM slot: EXPERTS are read directly from the mmap'd model,
+    // which the kernel pages in. We only hint the kernel to keep the expert's
+    // pages cached (via the prefetch callback, e.g. POSIX_FADV_WILLNEED).
+    // This avoids duplicating model memory in user-space slots (which caused OOM
+    // on the 23GB-RAM host) and avoids the page-cache eviction that corrupted
+    // compute input. load_cb is optional and unused when prefetch_cb is set.
+    if (prefetch_cb) {
+        prefetch_cb(layer, eid, type_idx);
+    } else if (load_cb) {
         auto t0 = std::chrono::steady_clock::now();
-        load_cb(layer, eid, type_idx, slot.data, needed);
+        load_cb(layer, eid, type_idx, slot.data, slot.size);
         auto t1 = std::chrono::steady_clock::now();
         stats_load_time_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
         stats_bytes_loaded += needed;

@@ -100,9 +100,14 @@ private:
 };
 
 // Check if a tensor name matches the expert tensor pattern.
-// Matches: blk.%d.ffn_gate_exps, blk.%d.ffn_up_exps, blk.%d.ffn_down_exps
+// Matches: blk.%d.ffn_gate_exps.weight, blk.%d.ffn_up_exps.weight, blk.%d.ffn_down_exps.weight
+// Only the actual weight tensors (ends in ".weight"). MXFP4 scales (ffn_*_exps_s, _in_s,
+// _sb, _s2) are per-expert shape {n_expert} and must NOT be treated as expert weights.
 inline bool tier_bridge::is_expert_tensor(const char * name) {
     if (!name) return false;
+    // Must end in ".weight" to exclude scale/bias tensors.
+    size_t len = strlen(name);
+    if (len < 7 || strcmp(name + len - 7, ".weight") != 0) return false;
     // Quick check: must contain "ffn_" and "exps"
     const char * ffn = strstr(name, "ffn_");
     if (!ffn) return false;

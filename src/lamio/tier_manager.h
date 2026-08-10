@@ -125,6 +125,10 @@ public:
     using load_fn = bool (*)(int layer, int eid, int type_idx, void * dest, size_t size);
     void set_load_callback(load_fn fn) { load_cb = fn; }
 
+    // Set external prefetch callback (non-blocking, hints kernel to cache pages).
+    using prefetch_fn = void (*)(int layer, int eid, int type_idx);
+    void set_prefetch_callback(prefetch_fn fn) { prefetch_cb = fn; }
+
     ~tier_manager();
 
     // Toggle prefetch (route-ahead).
@@ -137,6 +141,7 @@ private:
     std::vector<uint32_t> last;  // flattened: [layer][eid*3+type_idx]
     uint32_t clock = 1;
     load_fn load_cb = nullptr;
+    prefetch_fn prefetch_cb = nullptr;
     bool prefetch_enabled = false;
 
     int stats_hits   = 0;

@@ -28,6 +28,16 @@ bool tier_bridge::init(const char * gguf_path, size_t ram_budget,
         return n > 0;
     });
 
+    // Prefer kernel page-cache prefetch over user-space slots: hints the kernel
+    // to cache the expert's pages in the mmap'd model (POSIX_FADV_WILLNEED),
+    // reading the correct data directly without duplicating model memory.
+    manager_->set_prefetch_callback([](int layer, int eid, int type_idx) {
+        tier_bridge & self = instance();
+        const expert_tensor_info * info = self.find_tensor_info(layer, type_idx);
+        if (!info) return;
+        self.loader_.prefetch_expert(info->name.c_str(), eid, info->expert_bytes);
+    });
+
     enabled_ = true;
     return true;
 }
@@ -51,6 +61,16 @@ void tier_bridge::register_expert_tensor(const char * tensor_name, int eid,
     }
 
     tensor_infos_[key] = {tensor_name, expert_bytes, tensor_stride};
+
+    // Lamio FIX: also populate the tier_manager registry, which ensure_slot() consults
+    // to know an expert exists and how big it is. Without this, registry stays empty,
+    // ensure_slot() always returns registry.end(), and no expert is ever loaded.
+    // The file offset is resolved by name via expert_loader in the load callback, so 0.
+    if (manager_ && layer >= 0) {
+        for (int ex = 0; ex < (int)manager_->get_n_expert(); ex++) {
+            manager_->register_expert(layer, ex, type_idx, 0, expert_bytes, 0);
+        }
+    }
 }
 
 void tier_bridge::on_expert_select(int layer, int type_idx, const int * selected_experts, int k) {
