@@ -1,6 +1,8 @@
 ui/node_modules/
 ui/dist/
 build/
+v2/build/
+v2/build.*/
 *.o
 *.so
 *.a
@@ -8,3 +10,5 @@ models/
 fix_loader.py
 __pycache__/
 *.pyc
+server.log
+node_modules/
