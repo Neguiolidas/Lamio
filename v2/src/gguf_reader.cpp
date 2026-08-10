@@ -4,11 +4,14 @@
 #include <cstring>
 #include <sstream>
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include "gguf.h"
 
 namespace lamio {
 
-GgufReader::GgufReader(const std::string & path) {
+GgufReader::GgufReader(const std::string & path) : path_(path) {
     static const struct gguf_init_params params = {
         /* no_alloc   = */ true,
         /* ctx        = */ nullptr,
@@ -98,6 +101,26 @@ bool GgufReader::is_moe() const {
         }
     }
     return false;
+}
+
+size_t GgufReader::load_tensor_data(int64_t tensor_idx, void * dst, size_t max_bytes) const {
+    if (!ctx_ || dst == nullptr) return 0;
+    if (tensor_idx < 0 || tensor_idx >= gguf_get_n_tensors(ctx_)) return 0;
+
+    const size_t tsize = gguf_get_tensor_size(ctx_, tensor_idx);
+    const size_t toffset = gguf_get_tensor_offset(ctx_, tensor_idx);
+    const size_t data_off = gguf_get_data_offset(ctx_);
+    if (tsize > max_bytes) return 0;
+
+    int fd = open(path_.c_str(), O_RDONLY);
+    if (fd < 0) return 0;
+
+    const off_t abs_offset = (off_t)(data_off + toffset);
+    ssize_t n = pread(fd, dst, tsize, abs_offset);
+    close(fd);
+
+    if (n != (ssize_t)tsize) return 0;
+    return (size_t)n;
 }
 
 } // namespace lamio

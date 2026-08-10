@@ -43,9 +43,15 @@ public:
     // ffn_up_exps.weight / ffn_gate_exps.weight / ffn_down_exps.weight.
     bool is_moe() const;
 
+    // Load raw tensor data from the GGUF file into dst.
+    // Returns bytes read, or 0 on error.
+    // Uses pread to seek to the tensor's offset without disturbing other reads.
+    size_t load_tensor_data(int64_t tensor_idx, void * dst, size_t max_bytes) const;
+
 private:
     bool ok_      = false;
     std::string   error_;
+    std::string   path_;
     gguf_context * ctx_ = nullptr;
 
     std::unordered_map<std::string, std::string> metadata_;
