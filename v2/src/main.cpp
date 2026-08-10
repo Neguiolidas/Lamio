@@ -7,6 +7,13 @@
 #include "model_config.h"
 #include "block_tensors.h"
 #include "tokenizer.h"
+#include "weight_loader.h"
+#include "dense_forward.h"
+
+#include "ggml.h"
+#include "ggml-backend.h"
+#include "ggml-alloc.h"
+#include "ggml-cpu.h"
 
 static void print_info(const char * path) {
     lamio::GgufReader r(path);
@@ -91,6 +98,8 @@ int main(int argc, char ** argv) {
 
     bool info_mode = false;
     bool tokenize_mode = false;
+    bool list_mode = false;
+    bool generate_mode = false;
     const char * model_path = nullptr;
     std::string prompt_text;
 
@@ -102,6 +111,10 @@ int main(int argc, char ** argv) {
             if (i + 1 < argc) prompt_text = argv[++i];
         } else if (std::strcmp(argv[i], "--prompt") == 0) {
             if (i + 1 < argc) prompt_text = argv[++i];
+        } else if (std::strcmp(argv[i], "--list-tensors") == 0) {
+            list_mode = true;
+        } else if (std::strcmp(argv[i], "--generate") == 0) {
+            generate_mode = true;
         } else {
             model_path = argv[i];
         }
@@ -124,6 +137,151 @@ int main(int argc, char ** argv) {
         std::printf("tokens (%zu):", ids.size());
         for (int32_t id : ids) std::printf(" %d", id);
         std::printf("\ndecoded: %s\n", tok.decode(ids).c_str());
+        return 0;
+    }
+
+    // --generate: forward pass smoke test
+    std::string gen_prompt = prompt_text;
+    if (gen_prompt.empty()) gen_prompt = "Hello";
+    if (generate_mode) {
+        lamio::GgufReader r(model_path);
+        if (!r.ok()) { std::fprintf(stderr, "lamio: %s\n", r.error().c_str()); return 1; }
+
+        lamio::ModelConfig cfg = lamio::parse_model_config(r);
+        lamio::ModelTensors mt = lamio::map_tensors(r, cfg.n_layers);
+        lamio::BpeTokenizer tok;
+        if (!tok.load(r)) { std::fprintf(stderr, "lamio: tokenizer load failed\n"); return 1; }
+
+        std::vector<int32_t> prompt_ids = tok.encode(gen_prompt);
+        if (prompt_ids.empty()) { std::fprintf(stderr, "lamio: empty prompt\n"); return 1; }
+        std::printf("prompt: %s\n", gen_prompt.c_str());
+        std::printf("tokens: %zu\n", prompt_ids.size());
+
+        // ggml setup
+        ggml_backend_t backend = ggml_backend_cpu_init();
+        if (!backend) { std::fprintf(stderr, "lamio: backend init failed\n"); return 1; }
+
+        // Weight context: metadata only. Data allocated on backend via
+        // ggml_backend_alloc_ctx_tensors after all tensors are created.
+        size_t wpool = ggml_tensor_overhead() * 1024 + 16*1024*1024;
+        void * wbuf = malloc(wpool);
+        struct ggml_init_params wparams = { wpool, wbuf, true };
+        ggml_context * wctx = ggml_init(wparams);
+        if (!wctx) { std::fprintf(stderr, "lamio: weight ctx init failed\n"); return 1; }
+        lamio::WeightLoader wl(backend, wctx, r);
+
+        // Create all weight tensors (metadata only, no data yet).
+        ggml_tensor * embd_w = wl.load(mt.global.token_embd);
+        if (!embd_w) { std::fprintf(stderr, "lamio: token_embd load failed\n"); return 1; }
+
+        // Pre-create block weights (DenseForward loads ffn_norm/gate/up/down).
+        for (int l = 0; l < cfg.n_layers; ++l) {
+            if (mt.blocks[l].has_moe) continue;  // phase 3: dense only
+            if (mt.blocks[l].ffn_norm.tensor_idx >= 0) wl.load(mt.blocks[l].ffn_norm);
+            if (mt.blocks[l].ffn_gate.tensor_idx >= 0) wl.load(mt.blocks[l].ffn_gate);
+            if (mt.blocks[l].ffn_up.tensor_idx >= 0)   wl.load(mt.blocks[l].ffn_up);
+            if (mt.blocks[l].ffn_down.tensor_idx >= 0) wl.load(mt.blocks[l].ffn_down);
+        }
+        // Output weights
+        if (mt.global.output_norm.tensor_idx >= 0) wl.load(mt.global.output_norm);
+        if (mt.global.output_weight.tensor_idx >= 0) wl.load(mt.global.output_weight);
+
+        // Allocate all weight tensors on the backend.
+        ggml_backend_buffer_t wbackend_buf = ggml_backend_alloc_ctx_tensors(wctx, backend);
+        if (!wbackend_buf) { std::fprintf(stderr, "lamio: weight alloc failed\n"); return 1; }
+
+        // Load weight data from file into backend tensors.
+        size_t loaded = wl.load_all_data();
+        std::printf("loaded %zu weight tensors\n", loaded);
+        std::printf("embd: [%lld %lld] type=%d\n",
+                    (long long)embd_w->ne[0], (long long)embd_w->ne[1], (int)embd_w->type);
+
+        // compute context (graph tensors, no_alloc=true so gallocr handles data)
+        size_t compute_ctx_size = 128 * 1024 * 1024;  // 128MB arena
+        void * cbuf = malloc(compute_ctx_size);
+        struct ggml_init_params cparams = { compute_ctx_size, cbuf, true };
+        ggml_context * cctx = ggml_init(cparams);
+
+        // embedding lookup: create input token-id tensor, allocate + set data
+        int32_t first_id = prompt_ids[0];
+        ggml_tensor * idx = ggml_new_tensor_1d(cctx, GGML_TYPE_I32, 1);
+        ggml_backend_buffer_t input_buf = ggml_backend_alloc_ctx_tensors(cctx, backend);
+        if (!input_buf) { std::fprintf(stderr, "lamio: input alloc failed\n"); return 1; }
+        ggml_backend_tensor_set(idx, &first_id, 0, sizeof(int32_t));
+        ggml_tensor * x = ggml_get_rows(cctx, embd_w, idx);
+
+        // Forward through all blocks (FFN only, no attention yet)
+        for (int l = 0; l < cfg.n_layers; ++l) {
+            lamio::DenseForward df{cfg, wl, backend, cctx, 4};
+            x = df.forward(mt.blocks[l], x);
+            if (!x) { std::fprintf(stderr, "lamio: forward block %d failed\n", l); return 1; }
+        }
+
+        // output norm + output weight -> logits
+        if (mt.global.output_norm.tensor_idx >= 0) {
+            ggml_tensor * norm_w = wl.load(mt.global.output_norm);
+            if (norm_w) {
+                x = ggml_rms_norm(cctx, x, cfg.norm_eps);
+                x = ggml_mul(cctx, x, norm_w);
+            }
+        }
+        ggml_tensor * output_w = wl.load(mt.global.output_weight);
+        if (!output_w) output_w = embd_w;  // tied
+        ggml_tensor * logits = ggml_mul_mat(cctx, output_w, x);
+
+        // build graph
+        ggml_cgraph * gf = ggml_new_graph(cctx);
+        ggml_build_forward_expand(gf, logits);
+
+        // allocate compute tensors via gallocr (no_alloc ctx + backend)
+        ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
+        if (!galloc || !ggml_gallocr_alloc_graph(galloc, gf)) {
+            std::fprintf(stderr, "lamio: gallocr alloc failed\n");
+            if (galloc) ggml_gallocr_free(galloc);
+            return 1;
+        }
+
+        // compute
+        ggml_status status = ggml_backend_graph_compute(backend, gf);
+        if (status != GGML_STATUS_SUCCESS) { std::fprintf(stderr, "lamio: compute failed\n"); return 1; }
+
+        // read logits: argmax of last token
+        // After compute, logits data is in backend buffer. Read it back.
+        std::vector<float> logits_buf(cfg.vocab_size);
+        ggml_backend_tensor_get(logits, logits_buf.data(), 0,
+                                cfg.vocab_size * sizeof(float));
+        float * logits_data = logits_buf.data();
+
+        int32_t best_id = 0;
+        float best_val = -1e30f;
+        for (int i = 0; i < cfg.vocab_size; ++i) {
+            if (logits_data[i] > best_val) { best_val = logits_data[i]; best_id = i; }
+        }
+        std::printf("next token: %d (logit=%.4f)\n", best_id, best_val);
+        std::printf("decoded: %s\n", tok.decode({best_id}).c_str());
+
+        // cleanup
+        ggml_backend_buffer_free(input_buf);
+        ggml_gallocr_free(galloc);
+        ggml_free(cctx);
+        free(cbuf);
+        ggml_backend_buffer_free(wbackend_buf);
+        ggml_free(wctx);
+        free(wbuf);
+        ggml_backend_free(backend);
+        return 0;
+    }
+
+    if (list_mode) {
+        lamio::GgufReader r(model_path);
+        if (!r.ok()) { std::fprintf(stderr, "lamio: %s\n", r.error().c_str()); return 1; }
+        const auto & tensors = r.tensors();
+        for (size_t i = 0; i < tensors.size(); ++i) {
+            std::printf("%d\t%s\tne=[", (int)i, tensors[i].name.c_str());
+            for (int d = 0; d < tensors[i].n_dims; ++d)
+                std::printf("%s%lld", d ? " " : "", (long long)tensors[i].ne[d]);
+            std::printf("]\n");
+        }
         return 0;
     }
 

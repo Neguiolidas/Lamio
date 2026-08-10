@@ -12,3 +12,5 @@ __pycache__/
 *.pyc
 server.log
 node_modules/
+*.txt
+*.log

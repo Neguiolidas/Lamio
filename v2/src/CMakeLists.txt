@@ -3,6 +3,8 @@ add_library(lamio_core STATIC
     model_config.cpp
     block_tensors.cpp
     tokenizer.cpp
+    weight_loader.cpp
+    dense_forward.cpp
 )
 
 target_include_directories(lamio_core PUBLIC
@@ -11,12 +13,17 @@ target_include_directories(lamio_core PUBLIC
 )
 
 # ggml.c separated into ggml.so (base ops) + ggml-base.so (GGUF parser, etc.).
+# ggml-cpu.so has the CPU backend init.
 find_library(GGML_BASE_LIB NAMES ggml-base PATHS ${GGML_BUILD_DIR}/bin NO_DEFAULT_PATH)
+find_library(GGML_CPU_LIB  NAMES ggml-cpu  PATHS ${GGML_BUILD_DIR}/bin NO_DEFAULT_PATH)
 if(GGML_BASE_LIB)
   message(STATUS "Lamio v2 also linking libggml-base: ${GGML_BASE_LIB}")
 endif()
+if(GGML_CPU_LIB)
+  message(STATUS "Lamio v2 also linking libggml-cpu: ${GGML_CPU_LIB}")
+endif()
 
-target_link_libraries(lamio_core PUBLIC ${GGML_LIB} ${GGML_BASE_LIB})
+target_link_libraries(lamio_core PUBLIC ${GGML_LIB} ${GGML_BASE_LIB} ${GGML_CPU_LIB})
 target_compile_options(lamio_core PRIVATE -Wall -Wextra -O3)
 
 add_executable(lamio

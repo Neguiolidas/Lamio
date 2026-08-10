@@ -13,10 +13,11 @@ namespace lamio {
 // tensor index so the loader can find the offset/size later.
 struct TensorRef {
     std::string name;     // full name (e.g. "blk.0.attn_q.weight")
-    int64_t tensor_idx;   // index into GgufReader::tensors()
-    int n_dims;
+    int64_t tensor_idx = -1;  // index into GgufReader::tensors(); -1 = not found
+    int n_dims = 0;
     std::vector<int64_t> ne;
-    int64_t nbytes;
+    int64_t nbytes = 0;
+    int ggml_type = 0;    // enum ggml_type (read from GGUF)
 };
 
 // Tensors belonging to one transformer block.
@@ -30,6 +31,7 @@ struct BlockTensors {
     TensorRef attn_q     = {};
     TensorRef attn_k     = {};
     TensorRef attn_v     = {};
+    TensorRef attn_qkv   = {};  // fused QKV (hybrid/GQA models)
     TensorRef attn_output = {};
     TensorRef attn_norm   = {};  // pre-attention norm
 

@@ -66,9 +66,10 @@ GgufReader::GgufReader(const std::string & path) : path_(path) {
         tm.nbytes = (int64_t)gguf_get_tensor_size(ctx_, i);
         // GGML_MAX_DIMS = 4 always for ggml. Determine n_dims from ne.
         int dims = 4;
-        while (dims > 0 && ne[dims - 1] == 1) --dims;
+        while (dims > 1 && ne[dims - 1] == 1) --dims;
         tm.n_dims = dims;
         tm.ne.assign(ne, ne + 4);
+        tm.ggml_type = (int)gguf_get_tensor_type(ctx_, i);
         tensors_.push_back(tm);
     }
 

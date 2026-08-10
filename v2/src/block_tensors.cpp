@@ -14,6 +14,7 @@ static bool try_find(const GgufReader & r, const std::string & name, TensorRef &
             out.n_dims = tensors[i].n_dims;
             out.ne = tensors[i].ne;
             out.nbytes = tensors[i].nbytes;
+            out.ggml_type = tensors[i].ggml_type;
             return true;
         }
     }
@@ -32,14 +33,19 @@ static void scan_block(const GgufReader & r, BlockTensors & blk) {
     find_in_block("attn_q.weight", blk.attn_q);
     find_in_block("attn_k.weight", blk.attn_k);
     find_in_block("attn_v.weight", blk.attn_v);
+    find_in_block("attn_qkv.weight", blk.attn_qkv);
     find_in_block("attn_output.weight", blk.attn_output);
     find_in_block("attn_norm.weight", blk.attn_norm);
 
-    // Dense FFN
+    // Dense FFN: many architectures name the pre-FFN norm differently.
     find_in_block("ffn_gate.weight", blk.ffn_gate);
     find_in_block("ffn_up.weight", blk.ffn_up);
     find_in_block("ffn_down.weight", blk.ffn_down);
     find_in_block("ffn_norm.weight", blk.ffn_norm);
+    if (blk.ffn_norm.tensor_idx < 0)
+        find_in_block("post_attention_norm.weight", blk.ffn_norm);
+    if (blk.ffn_norm.tensor_idx < 0)
+        find_in_block("post_ffn_norm.weight", blk.ffn_norm);
 
     // MoE FFN
     find_in_block("ffn_gate_exps.weight", blk.ffn_gate_exps);

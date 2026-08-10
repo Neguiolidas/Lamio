@@ -36,6 +36,7 @@ public:
         int n_dims;
         std::vector<int64_t> ne;
         int64_t nbytes;
+        int ggml_type = 0;  // enum ggml_type
     };
     const std::vector<TensorMeta> & tensors() const { return tensors_; }
 
