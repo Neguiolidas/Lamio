@@ -2,6 +2,7 @@ add_library(lamio_core STATIC
     gguf_reader.cpp
     model_config.cpp
     block_tensors.cpp
+    tokenizer.cpp
 )
 
 target_include_directories(lamio_core PUBLIC

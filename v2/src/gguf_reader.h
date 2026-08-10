@@ -48,6 +48,13 @@ public:
     // Uses pread to seek to the tensor's offset without disturbing other reads.
     size_t load_tensor_data(int64_t tensor_idx, void * dst, size_t max_bytes) const;
 
+    // Read a GGUF array-of-strings metadata value (e.g. tokenizer.ggml.tokens).
+    // Returns false if the key is missing / not an array of strings.
+    bool get_string_array(const std::string & key, std::vector<std::string> & out) const;
+
+    // Read a GGUF array-of-int32 metadata value (e.g. tokenizer.ggml.token_type).
+    bool get_int32_array(const std::string & key, std::vector<int32_t> & out) const;
+
 private:
     bool ok_      = false;
     std::string   error_;

@@ -6,6 +6,7 @@
 #include "gguf_reader.h"
 #include "model_config.h"
 #include "block_tensors.h"
+#include "tokenizer.h"
 
 static void print_info(const char * path) {
     lamio::GgufReader r(path);
@@ -89,11 +90,18 @@ int main(int argc, char ** argv) {
     }
 
     bool info_mode = false;
+    bool tokenize_mode = false;
     const char * model_path = nullptr;
+    std::string prompt_text;
 
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--info") == 0) {
             info_mode = true;
+        } else if (std::strcmp(argv[i], "--tokenize") == 0) {
+            tokenize_mode = true;
+            if (i + 1 < argc) prompt_text = argv[++i];
+        } else if (std::strcmp(argv[i], "--prompt") == 0) {
+            if (i + 1 < argc) prompt_text = argv[++i];
         } else {
             model_path = argv[i];
         }
@@ -102,6 +110,21 @@ int main(int argc, char ** argv) {
     if (!model_path) {
         std::fprintf(stderr, "lamio: no model file specified\n");
         return 2;
+    }
+
+    if (tokenize_mode) {
+        lamio::GgufReader r(model_path);
+        if (!r.ok()) { std::fprintf(stderr, "lamio: %s\n", r.error().c_str()); return 1; }
+        lamio::BpeTokenizer tok;
+        if (!tok.load(r)) {
+            std::fprintf(stderr, "lamio: tokenizer load failed\n");
+            return 1;
+        }
+        auto ids = tok.encode(prompt_text);
+        std::printf("tokens (%zu):", ids.size());
+        for (int32_t id : ids) std::printf(" %d", id);
+        std::printf("\ndecoded: %s\n", tok.decode(ids).c_str());
+        return 0;
     }
 
     if (info_mode) {

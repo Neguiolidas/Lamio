@@ -123,4 +123,35 @@ size_t GgufReader::load_tensor_data(int64_t tensor_idx, void * dst, size_t max_b
     return (size_t)n;
 }
 
+bool GgufReader::get_string_array(const std::string & key, std::vector<std::string> & out) const {
+    if (!ctx_) return false;
+    const int64_t id = gguf_find_key(ctx_, key.c_str());
+    if (id < 0) return false;
+    if (gguf_get_kv_type(ctx_, id) != GGUF_TYPE_ARRAY) return false;
+    if (gguf_get_arr_type(ctx_, id) != GGUF_TYPE_STRING) return false;
+
+    out.clear();
+    const size_t n = gguf_get_arr_n(ctx_, id);
+    out.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        out.push_back(gguf_get_arr_str(ctx_, id, i));
+    }
+    return true;
+}
+
+bool GgufReader::get_int32_array(const std::string & key, std::vector<int32_t> & out) const {
+    if (!ctx_) return false;
+    const int64_t id = gguf_find_key(ctx_, key.c_str());
+    if (id < 0) return false;
+    if (gguf_get_kv_type(ctx_, id) != GGUF_TYPE_ARRAY) return false;
+    if (gguf_get_arr_type(ctx_, id) != GGUF_TYPE_INT32) return false;
+
+    out.clear();
+    const size_t n = gguf_get_arr_n(ctx_, id);
+    out.reserve(n);
+    const int32_t * data = static_cast<const int32_t *>(gguf_get_arr_data(ctx_, id));
+    for (size_t i = 0; i < n; ++i) out.push_back(data[i]);
+    return true;
+}
+
 } // namespace lamio
