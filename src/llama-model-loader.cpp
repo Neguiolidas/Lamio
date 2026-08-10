@@ -1530,23 +1530,9 @@ bool llama_model_loader::load_all_data(
             auto & bridge = lamio::tier_bridge::instance();
             if (bridge.is_enabled()) {
                 size_t expert_bytes = ggml_nbytes(cur) / cur->ne[2];
-                size_t tensor_stride = expert_bytes;
                 bridge.register_expert_tensor(ggml_get_name(cur), 0,
-                                               tensor_stride, expert_bytes);
-
-                size_t n_size = ggml_nbytes(cur);
-                if (use_mmap && cur->data == nullptr) {
-                    const auto & mapping = mappings.at(weight->idx);
-                    ggml_backend_buffer_t buf_mmap = nullptr;
-                    if (bufs.count(weight->idx)) {
-                        buf_mmap = bufs.at(weight->idx);
-                    }
-                    GGML_ASSERT(buf_mmap);
-                    ggml_backend_tensor_alloc(buf_mmap, cur, (uint8_t *) mapping->addr() + weight->offs);
-                }
-
-                size_done += n_size;
-                continue;
+                                               expert_bytes, expert_bytes);
+                // fall through to normal load path (no continue, no alloc here)
             }
         }
 
