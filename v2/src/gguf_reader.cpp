@@ -124,6 +124,16 @@ size_t GgufReader::load_tensor_data(int64_t tensor_idx, void * dst, size_t max_b
     return (size_t)n;
 }
 
+size_t GgufReader::tensor_offset(int64_t tensor_idx) const {
+    if (!ctx_ || tensor_idx < 0 || tensor_idx >= gguf_get_n_tensors(ctx_)) return 0;
+    return (size_t)gguf_get_tensor_offset(ctx_, tensor_idx);
+}
+
+size_t GgufReader::data_offset() const {
+    if (!ctx_) return 0;
+    return (size_t)gguf_get_data_offset(ctx_);
+}
+
 bool GgufReader::get_string_array(const std::string & key, std::vector<std::string> & out) const {
     if (!ctx_) return false;
     const int64_t id = gguf_find_key(ctx_, key.c_str());

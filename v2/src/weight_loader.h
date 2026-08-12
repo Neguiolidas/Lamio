@@ -37,6 +37,9 @@ public:
     // Returns the number of tensors successfully loaded.
     size_t load_all_data();
 
+    // Access the tensor->TensorRef map for external loading (e.g. mmap).
+    const std::unordered_map<ggml_tensor *, TensorRef> & refs_map() const { return refs_; }
+
 private:
     ggml_backend_t backend_;
     ggml_context * ctx_;

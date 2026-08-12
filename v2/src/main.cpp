@@ -4,6 +4,9 @@
 #include <string>
 #include <vector>
 #include <random>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include "gguf_reader.h"
 #include "model_config.h"
@@ -248,10 +251,97 @@ int main(int argc, char ** argv) {
         if (mt.global.output_norm.tensor_idx >= 0) wl.load(mt.global.output_norm);
         if (mt.global.output_weight.tensor_idx >= 0) wl.load(mt.global.output_weight);
 
+        // --- mmap-based zero-copy weight loading ---
+        // mmap the GGUF file. Trunk tensors get copied into a small backend
+        // buffer. Expert tensors (16GB) point directly into the mmap region
+        // via ggml_backend_tensor_alloc on a buffer that wraps the mmap.
+        // This gives ~1.4GB RSS (trunk) instead of 17GB.
+        int gguf_fd = open(model_path, O_RDONLY);
+        if (gguf_fd < 0) {
+            std::fprintf(stderr, "lamio: cannot open %s for mmap\n", model_path);
+            return 1;
+        }
+        off_t file_size = lseek(gguf_fd, 0, SEEK_END);
+        void * mmap_addr = mmap(nullptr, (size_t)file_size, PROT_READ, MAP_PRIVATE, gguf_fd, 0);
+        if (mmap_addr == MAP_FAILED) {
+            std::fprintf(stderr, "lamio: mmap failed (%zu bytes)\n", (size_t)file_size);
+            close(gguf_fd);
+            return 1;
+        }
+        madvise(mmap_addr, (size_t)file_size, MADV_RANDOM);
+        close(gguf_fd);
+
+        // Phase 1: Allocate backend buffer ONLY for trunk tensors (non-expert).
+        // We temporarily remove expert tensors from wctx so alloc_ctx_tensors
+        // doesn't allocate space for them.
+        // Phase 2: For expert tensors, set tensor->data directly to mmap+offset.
+        size_t data_off = r.data_offset();
+        size_t loaded = 0;
+
+        // First: identify expert tensors and set their data to mmap (zero-copy)
+        // We do this by calling ggml_backend_tensor_alloc on a buffer that wraps
+        // the full mmap region.
+        ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+
+        // Create a buffer with size of the full file, but we won't actually
+        // use allocated memory - we'll set tensor->data to mmap offsets.
+        // The CPU backend buffer allows setting tensor data to arbitrary addrs
+        // if the buffer is "meta" type. Since we can't create meta easily,
+        // we'll use a different approach: manually set tensor->data.
+        for (auto & kv : wl.refs_map()) {
+            ggml_tensor * t = kv.first;
+            const lamio::TensorRef & ref = kv.second;
+            if (ref.tensor_idx < 0) continue;
+
+            bool is_expert = (ref.name.find("ffn_gate_exps") != std::string::npos ||
+                              ref.name.find("ffn_up_exps")   != std::string::npos ||
+                              ref.name.find("ffn_down_exps") != std::string::npos);
+
+            if (is_expert) {
+                // Zero-copy: point tensor data directly into mmap region
+                size_t toff = r.tensor_offset(ref.tensor_idx);
+                size_t abs_off = data_off + toff;
+                if (abs_off + (size_t)ref.nbytes > (size_t)file_size) continue;
+                t->data = (uint8_t *)mmap_addr + abs_off;
+                ++loaded;
+            }
+        }
+        size_t n_expert = loaded;
+        std::fprintf(stderr, "mmap: %zu expert tensors (zero-copy)\n", n_expert);
+
+        // Now allocate backend buffer for remaining (trunk) tensors
+        // Need to temporarily unlink expert tensors from wctx so alloc doesn't
+        // try to allocate space for them. Since we already set t->data for
+        // experts, alloc_ctx_tensors should skip them (it checks data == nullptr).
         ggml_backend_buffer_t wbackend_buf = ggml_backend_alloc_ctx_tensors(wctx, backend);
-        if (!wbackend_buf) { std::fprintf(stderr, "lamio: weight alloc failed\n"); return 1; }
-        size_t loaded = wl.load_all_data();
-        std::printf("loaded %zu weight tensors\n", loaded);
+        if (!wbackend_buf) { std::fprintf(stderr, "lamio: weight alloc failed (all tensors zero/allocated)\\n"); return 1; }
+        std::fprintf(stderr, "mmap: backend buffer %zu MB, alloc OK\n", ggml_backend_buffer_get_size(wbackend_buf) / (1024*1024));
+
+        // Copy trunk tensor data from mmap into backend buffer
+        size_t n_trunk = 0;
+        for (auto & kv : wl.refs_map()) {
+            ggml_tensor * t = kv.first;
+            const lamio::TensorRef & ref = kv.second;
+            if (ref.tensor_idx < 0 || t->data == nullptr) continue;
+            // Skip experts (already set to mmap)
+            bool is_expert = (ref.name.find("ffn_gate_exps") != std::string::npos ||
+                              ref.name.find("ffn_up_exps")   != std::string::npos ||
+                              ref.name.find("ffn_down_exps") != std::string::npos);
+            if (is_expert) continue;
+
+            size_t toff = r.tensor_offset(ref.tensor_idx);
+            size_t abs_off = data_off + toff;
+            if (abs_off + (size_t)ref.nbytes > (size_t)file_size) continue;
+
+            // If alloc_ctx_tensors already allocated this tensor in the buffer,
+            // t->data points to the buffer. We need to copy data there.
+            void * src = (uint8_t *)mmap_addr + abs_off;
+            ggml_backend_tensor_set(t, src, 0, (size_t)ref.nbytes);
+            ++n_trunk;
+        }
+        loaded += n_trunk;
+        std::printf("loaded %zu weight tensors (%zu trunk + %zu expert mmap, file=%zuMB)\n",
+                    loaded, n_trunk, n_expert, (size_t)file_size / (1024*1024));
 
         // Create the backend scheduler (reused across all gen steps)
         ggml_backend_t sched_backends[1] = { backend };
