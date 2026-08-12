@@ -13,6 +13,7 @@
 #include "dense_forward.h"
 #include "qwen35_forward.h"
 #include "sampling.h"
+// server.h not needed - serve mode uses httplib inline
 
 #include "ggml.h"
 #include "ggml-backend.h"

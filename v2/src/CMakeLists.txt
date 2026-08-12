@@ -24,7 +24,7 @@ if(GGML_CPU_LIB)
   message(STATUS "Lamio v2 also linking libggml-cpu: ${GGML_CPU_LIB}")
 endif()
 
-target_link_libraries(lamio_core PUBLIC ${GGML_LIB} ${GGML_BASE_LIB} ${GGML_CPU_LIB})
+target_link_libraries(lamio_core PUBLIC ${GGML_LIB} ${GGML_BASE_LIB} ${GGML_CPU_LIB} pthread)
 target_compile_options(lamio_core PRIVATE -Wall -Wextra -O3)
 
 add_executable(lamio
