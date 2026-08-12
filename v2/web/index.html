@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lamio</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar" class="sidebar">
+    <div class="sidebar-header">
+      <span class="logo-mark"></span>
+      <span class="sidebar-title">Lamio</span>
+    </div>
+    <nav class="sidebar-nav">
+      <a class="nav-item active" data-view="chat" onclick="switchView('chat')">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+        <span class="nav-label">Chat</span>
+      </a>
+      <a class="nav-item" data-view="models" onclick="switchView('models')">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+        <span class="nav-label">Models</span>
+      </a>
+      <a class="nav-item" data-view="memory" onclick="switchView('memory')">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 19v-3M10 19v-6M14 19v-4M18 19v-8M4 9l4-4 4 4 4-6"/></svg>
+        <span class="nav-label">Memory</span>
+      </a>
+      <a class="nav-item" data-view="telemetry" onclick="switchView('telemetry')">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="M7 14l4-4 4 4 6-6"/></svg>
+        <span class="nav-label">Telemetry</span>
+      </a>
+      <a class="nav-item" data-view="settings" onclick="switchView('settings')">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        <span class="nav-label">Settings</span>
+      </a>
+    </nav>
+    <div class="sidebar-footer">
+      <div class="status-pill" id="serverStatus">
+        <span class="status-dot"></span>
+        <span class="nav-label">Connecting</span>
+      </div>
+    </div>
+  </aside>
+
+  <main id="main" class="main">
+    <header class="topbar">
+      <button id="toggleSidebar" class="icon-btn" onclick="toggleSidebar()" title="Toggle sidebar">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+      <h1 class="topbar-title" id="topbarTitle">Chat</h1>
+      <div class="topbar-right">
+        <span class="model-badge" id="modelBadge">No model</span>
+      </div>
+    </header>
+
+    <div class="content" id="content">
+      <!-- Chat view -->
+      <div class="view view-chat active" id="view-chat">
+        <div class="chat-messages" id="chatMessages"></div>
+        <div class="chat-input-bar">
+          <textarea id="chatInput" class="chat-input" placeholder="Send a message..." rows="1" onkeydown="onChatKeydown(event)" oninput="autoResize(this)"></textarea>
+          <button class="send-btn" id="sendBtn" onclick="sendMessage()">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+          </button>
+          <button class="stop-btn hidden" id="stopBtn" onclick="stopGeneration()">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>
+          </button>
+        </div>
+      </div>
+
+      <!-- Models view -->
+      <div class="view view-models" id="view-models">
+        <div class="card-list" id="modelList"></div>
+      </div>
+
+      <!-- Memory view -->
+      <div class="view view-memory" id="view-memory">
+        <div class="memory-panel">
+          <p class="muted">KV cache and recurrent state inspector.</p>
+          <div id="memoryContent" class="memory-content"></div>
+        </div>
+      </div>
+
+      <!-- Telemetry view -->
+      <div class="view view-telemetry" id="view-telemetry">
+        <div class="telemetry-grid" id="telemetryGrid"></div>
+      </div>
+
+      <!-- Settings view -->
+      <div class="view view-settings" id="view-settings">
+        <div class="settings-panel" id="settingsPanel"></div>
+      </div>
+    </div>
+  </main>
+</div>
+<script src="app.js"></script>
+</body>
+</html>
