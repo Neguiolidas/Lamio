@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Lamio v2 HTTP server. Serves the web UI and manages a persistent lamio --repl process."""
+"""Lamio v2 HTTP server. Self-contained UI + API. Uses lamio binary for inference."""
 
 import http.server
 import json
@@ -12,6 +12,8 @@ import struct
 import logging
 import threading
 import select
+import fcntl
+import re
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger('lamio')
@@ -20,19 +22,10 @@ HOST = '0.0.0.0'
 PORT = 5180
 FILE_DIR = os.path.dirname(os.path.abspath(__file__))
 WEB_DIR = os.path.join(FILE_DIR, 'web')
-MODELS_DIR = os.path.join(os.path.dirname(os.path.dirname(FILE_DIR)), 'models')
-# Fix: FILE_DIR = .../v2, models = .../Lamio/models (one level up from v2)
-if not os.path.isdir(MODELS_DIR):
-    MODELS_DIR = os.path.join(os.path.dirname(FILE_DIR), 'models')
+MODELS_DIR = os.path.join(os.path.dirname(FILE_DIR), 'models')
 LAMIO_BIN = os.path.join(FILE_DIR, 'build', 'src', 'lamio')
-LD_PATH = os.path.join(os.path.dirname(os.path.dirname(FILE_DIR)), 'build', 'bin')
-# Fix: same pattern as MODELS_DIR
-if not os.path.isdir(LD_PATH):
-    LD_PATH = os.path.join(os.path.dirname(FILE_DIR), 'build', 'bin')
+LD_PATH = os.path.join(os.path.dirname(FILE_DIR), 'build', 'bin')
 
-repl_proc = None
-repl_model = None
-repl_lock = threading.Lock()
 current_model = None
 current_model_name = None
 telemetry = {'total_tokens': 0, 'last_tps': 0, 'last_elapsed': 0}
@@ -50,128 +43,30 @@ def get_rss():
     return 0
 
 
-def get_repl_rss():
-    if repl_proc and repl_proc.poll() is None:
-        try:
-            with open(f'/proc/{repl_proc.pid}/status') as f:
-                for line in f:
-                    if line.startswith('VmRSS:'):
-                        return int(line.split()[1]) // 1024
-        except:
-            pass
-    return 0
-
-
-def start_repl(model_path, temp=0.7, top_k=40, top_p=0.9, repeat_penalty=1.1, seed=-1, n_gen=128):
-    """Start a persistent lamio --repl process."""
-    global repl_proc, repl_model
-    stop_repl()
-    args = [LAMIO_BIN, model_path, '--repl', '--n-gen', str(n_gen),
-            '--temp', str(temp), '--top-k', str(top_k), '--top-p', str(top_p),
-            '--repeat-penalty', str(repeat_penalty)]
-    if seed and seed > 0:
-        args.extend(['--seed', str(seed)])
-    env = os.environ.copy()
-    env['LD_LIBRARY_PATH'] = LD_PATH
-    log.info(f'starting repl: {model_path}')
-    repl_proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                 stderr=subprocess.PIPE, env=env, bufsize=0)
-    repl_model = model_path
-    # Wait for "repl: ready" on stderr
-    wait_for_ready()
-
-
-def stop_repl():
-    global repl_proc, repl_model
-    if repl_proc:
-        try:
-            repl_proc.stdin.close()
-            repl_proc.wait(timeout=5)
-        except:
-            repl_proc.kill()
-        repl_proc = None
-    repl_model = None
-
-
-def wait_for_ready(timeout=120):
-    """Wait for 'repl: ready' on stderr."""
-    if not repl_proc:
-        return False
-    start = time.time()
-    while time.time() - start < timeout:
-        ready, _, _ = select.select([repl_proc.stderr], [], [], 0.5)
-        if ready:
-            line = repl_proc.stderr.readline().decode('utf-8', errors='replace').strip()
-            log.info(f'repl stderr: {line}')
-            if 'repl: ready' in line:
-                return True
-            if 'failed' in line.lower() or 'error' in line.lower():
-                return False
-    log.warning('repl: ready timeout')
-    return False
-
-
-def send_prompt(prompt):
-    """Send a prompt to the persistent REPL and read the response."""
-    global telemetry
-    if not repl_proc or repl_proc.poll() is not None:
-        return {'error': 'model not loaded'}, 500
-    with repl_lock:
-        import fcntl
-        # Make stdout non-blocking
-        stdout_fd = repl_proc.stdout.fileno()
-        stderr_fd = repl_proc.stderr.fileno()
-        fl = fcntl.fcntl(stdout_fd, fcntl.F_GETFL)
-        fcntl.fcntl(stdout_fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
-
-        t0 = time.time()
-        try:
-            repl_proc.stdin.write((prompt + '\n').encode())
-            repl_proc.stdin.flush()
-        except BrokenPipeError:
-            return {'error': 'model process died'}, 500
-
-        output = b''
-        while True:
-            # Check stderr for ready signal
-            ready_err, _, _ = select.select([stderr_fd], [], [], 0.1)
-            if ready_err:
-                try:
-                    line = os.read(stderr_fd, 4096).decode('utf-8', errors='replace').strip()
-                    if line:
-                        log.info(f'repl stderr: {line}')
-                    if 'repl: ready' in line:
-                        break
-                    if 'failed' in line.lower() or 'error' in line.lower() or 'assert' in line.lower():
-                        log.error(f'repl error: {line}')
-                        return {'error': f'model error: {line}'}, 500
-                except BlockingIOError:
-                    pass
-
-            # Read stdout
-            try:
-                chunk = os.read(stdout_fd, 4096)
-                if chunk:
-                    output += chunk
-            except BlockingIOError:
-                pass
-
-            if time.time() - t0 > 600:
-                log.error('repl: generation timed out')
-                return {'error': 'generation timed out'}, 504
-
-        # Restore blocking mode
-        fcntl.fcntl(stdout_fd, fcntl.F_SETFL, fl)
-
-        elapsed = time.time() - t0
-        text = output.decode('utf-8', errors='replace').strip()
-        n_tok = len([w for w in text.split() if w]) if text else 0
-        tps = n_tok / elapsed if elapsed > 0 else 0
-        telemetry['total_tokens'] += n_tok
-        telemetry['last_tps'] = round(tps, 2)
-        telemetry['last_elapsed'] = round(elapsed, 2)
-        log.info(f'generate done: {n_tok} tokens in {elapsed:.1f}s ({tps:.1f} t/s)')
-        return {'text': text, 'tokens': n_tok, 'tps': round(tps, 2), 'elapsed': round(elapsed, 2)}, 200
+def build_chatml_prompt(messages, model_name=''):
+    """Build a prompt. For base (non-instruct) models, just concatenate user messages."""
+    has_assistant = any(m.get('role') == 'assistant' for m in messages)
+    if not has_assistant:
+        # Base model: just use the last user message as prompt
+        # History shown as context
+        context = ''
+        for msg in messages[:-1]:
+            context += msg.get('content', '') + ' '
+        prompt = context + messages[-1].get('content', '') if messages else ''
+        return prompt
+    # Chat model: use ChatML
+    prompt = ''
+    for msg in messages:
+        role = msg.get('role', 'user')
+        content = msg.get('content', '')
+        if role == 'system':
+            prompt += f'<|im_start|>system\n{content}<|im_end|>\n'
+        elif role == 'user':
+            prompt += f'<|im_start|>user\n{content}<|im_end|>\n'
+        elif role == 'assistant':
+            prompt += f'<|im_start|>assistant\n{content}<|im_end|>\n'
+    prompt += '<|im_start|>assistant\n'
+    return prompt
 
 
 def parse_gguf_header(path):
@@ -264,12 +159,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == '/api/health':
-            model_name = current_model_name
             hdr = parse_gguf_header(current_model) if current_model else {}
             self._send_json({
                 'status': 'online' if current_model else 'ready',
                 'model_loaded': current_model is not None,
-                'model': model_name,
+                'model': current_model_name,
                 'arch': hdr.get('arch'),
                 'n_ctx': hdr.get('n_ctx', 0),
             })
@@ -289,7 +183,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 })
             self._send_json(models)
         elif self.path == '/api/telemetry':
-            self._send_json({**telemetry, 'model': current_model_name, 'rss_mb': get_repl_rss()})
+            self._send_json({**telemetry, 'model': current_model_name, 'rss_mb': get_rss()})
         elif self.path == '/api/memory':
             self._send_json({'layers': []})
         elif self.path == '/' or self.path == '/index.html':
@@ -325,66 +219,78 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif self.path == '/api/models/unload':
             current_model = None
             current_model_name = None
-            stop_repl()
             log.info('unloaded model')
             self._send_json({'ok': True})
 
+        elif self.path == '/v1/chat/completions':
+            self._handle_chat_completions(body)
+
         elif self.path == '/api/generate':
-            if not current_model:
-                self._send_json({'error': 'no model loaded'}, 400)
-                return
+            self._handle_chat_completions(body)
 
-            prompt = body.get('prompt', '')
-            history = body.get('history', [])
-            temp = body.get('temperature', 0.7)
-            top_k = body.get('top_k', 40)
-            top_p = body.get('top_p', 0.9)
-            repeat_pen = body.get('repeat_penalty', 1.1)
-            n_predict = body.get('n_predict', 128)
-            seed = body.get('seed', -1)
-            n_ctx = body.get('n_ctx', 2048)
+        else:
+            self._send_json({'error': 'not found'}, 404)
 
-            # Truncate history to fit context window (rough char-based estimate: 4 chars ~= 1 token)
-            max_hist_chars = max(0, (n_ctx - n_predict - len(prompt))) * 4
-            truncated_hist = []
-            char_count = 0
-            for msg in reversed(history):
-                if char_count + len(msg) > max_hist_chars:
+    def _handle_chat_completions(self, body):
+        """Handle chat completion with ChatML formatting and SSE streaming."""
+        if not current_model:
+            self._send_json({'error': 'no model loaded'}, 400)
+            return
+
+        messages = body.get('messages', [])
+        temperature = body.get('temperature', 0.7)
+        top_k = body.get('top_k', 40)
+        top_p = body.get('top_p', 0.9)
+        repeat_penalty = body.get('repeat_penalty', body.get('repeat_pen', 1.1))
+        n_predict = body.get('max_tokens', body.get('n_predict', 128))
+        seed = body.get('seed', -1)
+        n_ctx = body.get('n_ctx', 2048)
+        stream = body.get('stream', True)
+        stop_strings = body.get('stop', ['<|im_end|>', '</s>', '<|endoftext|>'])
+
+        # Build ChatML prompt
+        full_prompt = build_chatml_prompt(messages)
+        truncated = False
+
+        # Truncate if too long (rough: 4 chars ~= 1 token)
+        max_chars = n_ctx * 4
+        if len(full_prompt) > max_chars:
+            # Keep system message + last N messages
+            system_msgs = [m for m in messages if m.get('role') == 'system']
+            non_system = [m for m in messages if m.get('role') != 'system']
+            keep = []
+            char_budget = max_chars - sum(len(str(m.get('content', ''))) for m in system_msgs) - 200
+            for msg in reversed(non_system):
+                msg_len = len(str(msg.get('content', '')))
+                if char_budget - msg_len < 0:
                     break
-                truncated_hist.insert(0, msg)
-                char_count += len(msg)
+                keep.insert(0, msg)
+                char_budget -= msg_len
+            truncated = True
+            full_prompt = build_chatml_prompt(system_msgs + keep)
 
-            # Build chat-formatted prompt
-            if truncated_hist:
-                full_prompt = ''
-                for i, msg in enumerate(truncated_hist):
-                    role = 'User' if i % 2 == 0 else 'Assistant'
-                    full_prompt += f'{role}: {msg}\n'
-                full_prompt += f'User: {prompt}\nAssistant: '
-            else:
-                full_prompt = prompt
+        args = [LAMIO_BIN, current_model, '--generate', '--prompt', full_prompt,
+                '--n-gen', str(n_predict), '--temp', str(temperature),
+                '--top-k', str(top_k), '--top-p', str(top_p),
+                '--repeat-penalty', str(repeat_penalty)]
+        if seed and seed > 0:
+            args.extend(['--seed', str(seed)])
 
-            args = [LAMIO_BIN, current_model, '--generate', '--prompt', full_prompt,
-                    '--n-gen', str(n_predict), '--temp', str(temp),
-                    '--top-k', str(top_k), '--top-p', str(top_p),
-                    '--repeat-penalty', str(repeat_pen)]
-            if seed and seed > 0:
-                args.extend(['--seed', str(seed)])
+        env = os.environ.copy()
+        env['LD_LIBRARY_PATH'] = LD_PATH
 
-            env = os.environ.copy()
-            env['LD_LIBRARY_PATH'] = LD_PATH
+        log.info(f'chat: messages={len(messages)} prompt_len={len(full_prompt)} '
+                 f'n_predict={n_predict} stream={stream}')
 
-            log.info(f'generate: prompt_len={len(full_prompt)} n_predict={n_predict} '
-                     f'hist={len(truncated_hist)} ctx={n_ctx}')
+        if not stream:
+            # Non-streaming: wait for full output
             t0 = time.time()
             try:
                 result = subprocess.run(args, capture_output=True, text=True,
                                         timeout=600, env=env)
                 elapsed = time.time() - t0
-
                 if result.returncode != 0:
-                    log.error(f'lamio exit {result.returncode}: {result.stderr[-200:]}')
-                    self._send_json({'error': f'lamio exited with code {result.returncode}',
+                    self._send_json({'error': f'lamio exit {result.returncode}',
                                      'stderr': result.stderr[-500:]}, 500)
                     return
 
@@ -394,24 +300,154 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         text = line[9:]
                         break
 
-                gen_lines = [l for l in result.stdout.splitlines() if l.startswith('[') and 'token=' in l]
+                gen_lines = [l for l in result.stdout.splitlines()
+                             if l.startswith('[') and 'token=' in l]
                 n_tok = len(gen_lines)
                 tps = n_tok / elapsed if elapsed > 0 else 0
                 telemetry['total_tokens'] += n_tok
                 telemetry['last_tps'] = round(tps, 2)
                 telemetry['last_elapsed'] = round(elapsed, 2)
 
-                log.info(f'generate done: {n_tok} tokens in {elapsed:.1f}s ({tps:.1f} t/s)')
-                self._send_json({'text': text, 'tokens': n_tok, 'tps': round(tps, 2),
-                                 'elapsed': round(elapsed, 2)})
+                self._send_json({
+                    'choices': [{'message': {'role': 'assistant', 'content': text}}],
+                    'usage': {'total_tokens': n_tok},
+                })
             except subprocess.TimeoutExpired:
-                log.error(f'generate timed out after 600s')
-                self._send_json({'error': 'generation timed out (600s limit)'}, 504)
-            except Exception as e:
-                log.error(f'generate exception: {e}')
-                self._send_json({'error': str(e)}, 500)
-        else:
-            self._send_json({'error': 'not found'}, 404)
+                self._send_json({'error': 'generation timed out'}, 504)
+            return
+
+        # SSE streaming
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/event-stream')
+        self.send_header('Cache-Control', 'no-cache')
+        self.send_header('Connection', 'keep-alive')
+        self.end_headers()
+
+        t0 = time.time()
+        try:
+            proc = subprocess.Popen(args, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, env=env, bufsize=0)
+            stdout_fd = proc.stdout.fileno()
+            stderr_fd = proc.stderr.fileno()
+            fl = fcntl.fcntl(stdout_fd, fcntl.F_GETFL)
+            fcntl.fcntl(stdout_fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+
+            buf = b''
+            n_tok = 0
+            full_text = ''
+
+            while True:
+                # Check stderr for errors
+                ready_err, _, _ = select.select([stderr_fd], [], [], 0.1)
+                if ready_err:
+                    try:
+                        err_data = os.read(stderr_fd, 4096).decode('utf-8', errors='replace')
+                        if 'assert' in err_data.lower() or 'failed' in err_data.lower():
+                            log.error(f'lamio stderr: {err_data}')
+                            self._sse_send({'error': err_data})
+                            break
+                    except BlockingIOError:
+                        pass
+
+                # Read stdout
+                try:
+                    chunk = os.read(stdout_fd, 4096)
+                    if chunk:
+                        buf += chunk
+                        while b'\n' in buf:
+                            line, buf = buf.split(b'\n', 1)
+                            line_str = line.decode('utf-8', errors='replace').strip()
+                            # Parse token lines
+                            m = re.match(r'\[\d+\] token=(\d+) logit=([\d.\-]+)', line_str)
+                            if m:
+                                token_id = int(m.group(1))
+                                n_tok += 1
+                            elif line_str.startswith('piece:'):
+                                # Decoded token piece
+                                piece = line_str[6:]
+                                # Check for stop strings
+                                full_text += piece
+                                # Check if any stop string is in the text
+                                stop_found = False
+                                for ss in stop_strings:
+                                    if ss in full_text:
+                                        # Truncate at stop string
+                                        full_text = full_text[:full_text.index(ss)]
+                                        stop_found = True
+                                        break
+                                if stop_found:
+                                    self._sse_send({
+                                        'choices': [{'delta': {'content': piece}, 'finish_reason': 'stop'}]
+                                    })
+                                    break
+                                if not stop_found:
+                                    self._sse_send({
+                                        'choices': [{'delta': {'content': piece}}]
+                                    })
+                except BlockingIOError:
+                    pass
+
+                # Check if process finished
+                if proc.poll() is not None:
+                    # Read remaining stdout
+                    try:
+                        remaining = os.read(stdout_fd, 65536)
+                        if remaining:
+                            buf += remaining
+                    except BlockingIOError:
+                        pass
+                    # Process any remaining lines
+                    while b'\n' in buf:
+                        line, buf = buf.split(b'\n', 1)
+                        line_str = line.decode('utf-8', errors='replace').strip()
+                        if line_str.startswith('decoded: '):
+                            full_text = line_str[9:]
+                            break
+                    break
+
+                if time.time() - t0 > 600:
+                    log.error('streaming timed out')
+                    self._sse_send({'error': 'timed out'})
+                    proc.kill()
+                    break
+
+            fcntl.fcntl(stdout_fd, fcntl.F_SETFL, fl)
+
+            elapsed = time.time() - t0
+            tps = n_tok / elapsed if elapsed > 0 else 0
+            telemetry['total_tokens'] += n_tok
+            telemetry['last_tps'] = round(tps, 2)
+            telemetry['last_elapsed'] = round(elapsed, 2)
+
+            # Send final message with full text
+            self._sse_send({
+                'choices': [{'delta': {'content': full_text}, 'finish_reason': 'stop'}],
+                'usage': {'total_tokens': n_tok},
+            })
+            # Send [DONE]
+            try:
+                self.wfile.write(b'data: [DONE]\n\n')
+                self.wfile.flush()
+            except BrokenPipeError:
+                pass
+
+            log.info(f'chat done: {n_tok} tokens in {elapsed:.1f}s ({tps:.1f} t/s)')
+
+        except Exception as e:
+            log.error(f'chat exception: {e}')
+            try:
+                self._sse_send({'error': str(e)})
+            except:
+                pass
+
+    def _sse_send(self, data):
+        """Send a Server-Sent Event."""
+        line = f'data: {json.dumps(data)}\n\n'
+        try:
+            self.wfile.write(line.encode())
+            self.wfile.flush()
+        except BrokenPipeError:
+            pass
 
     def log_message(self, format, *args):
         pass
@@ -428,7 +464,6 @@ def main():
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
-        stop_repl()
         log.info('shutting down')
 
 

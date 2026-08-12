@@ -344,6 +344,13 @@ body {
 
 .muted { color: var(--text-muted); font-size: 14px; }
 
+.empty-chat {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+}
+
 /* === Models === */
 .card-list {
   padding: 24px;

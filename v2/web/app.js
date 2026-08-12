@@ -1,5 +1,8 @@
 let serverState = 'connecting';
-let config = { model: '', temperature: 0.7, top_k: 40, top_p: 0.9, repeat_penalty: 1.1, n_predict: 128, seed: -1, n_ctx: 2048 };
+let config = {
+  model: '', temperature: 0.7, top_k: 40, top_p: 0.9,
+  repeat_penalty: 1.1, n_predict: 256, seed: -1, n_ctx: 2048
+};
 let messageHistory = [];
 let streaming = false;
 let abortCtrl = null;
@@ -40,6 +43,9 @@ async function checkHealth() {
         $('modelBadge').textContent = d.model;
         $('modelBadge').classList.add('active');
         config.model = d.model;
+      } else {
+        $('modelBadge').textContent = 'No model';
+        $('modelBadge').classList.remove('active');
       }
     } else {
       setServerState('offline');
@@ -57,16 +63,20 @@ async function fetchModels() {
     const list = $('modelList');
     list.innerHTML = '';
     if (models.length === 0) {
-      list.innerHTML = '<p class="muted">No models found in the models directory.</p>';
+      list.innerHTML = '<p class="muted">No models found.</p>';
       return;
     }
     for (const m of models) {
       const card = document.createElement('div');
       card.className = 'model-card' + (m.loaded ? ' loaded' : '');
+      const sizeStr = formatBytes(m.size);
+      const metaParts = [m.arch, m.n_layers + ' layers'];
+      if (m.n_experts) metaParts.push(m.n_experts + ' experts');
+      if (m.n_ctx) metaParts.push((m.n_ctx / 1024).toFixed(0) + 'K ctx');
       card.innerHTML = `
         <div class="model-info">
           <span class="model-name">${m.name}</span>
-          <span class="model-meta">${formatBytes(m.size)} | ${m.arch || 'unknown'} | ${m.params || ''}</span>
+          <span class="model-meta">${sizeStr} | ${metaParts.join(' | ')}</span>
         </div>
         <div class="model-actions">
           ${m.loaded
@@ -88,32 +98,22 @@ async function loadModel(name) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ model: name })
     });
-    if (r.ok) {
-      checkHealth();
-      fetchModels();
-    } else {
+    if (r.ok) { checkHealth(); fetchModels(); }
+    else {
       const e = await r.json().catch(() => ({}));
       alert(e.error || 'Failed to load model');
     }
-  } catch (e) {
-    alert('Load failed: ' + e.message);
-  }
+  } catch (e) { alert('Load failed: ' + e.message); }
 }
 
 async function unloadModel(name) {
   try {
     const r = await fetch('/api/models/unload', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ model: name })
     });
-    if (r.ok) {
-      checkHealth();
-      fetchModels();
-    }
-  } catch (e) {
-    alert('Unload failed: ' + e.message);
-  }
+    if (r.ok) { checkHealth(); fetchModels(); }
+  } catch (e) { alert('Unload failed: ' + e.message); }
 }
 
 async function sendMessage() {
@@ -126,6 +126,7 @@ async function sendMessage() {
   input.value = '';
   autoResize(input);
 
+  const assistantIdx = messageHistory.length;
   messageHistory.push({ role: 'assistant', content: '' });
   streaming = true;
   $('sendBtn').classList.add('hidden');
@@ -134,32 +135,66 @@ async function sendMessage() {
 
   abortCtrl = new AbortController();
   try {
-    const r = await fetch('/api/generate', {
+    const r = await fetch('/v1/chat/completions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        prompt: text,
-        history: messageHistory.filter(m => m.role !== 'assistant' || m.content).slice(0, -1).map(m => m.content),
+        model: config.model,
+        messages: messageHistory.filter(m => m.role === 'user' || m.content).slice(0, -1),
         temperature: config.temperature,
         top_k: config.top_k,
         top_p: config.top_p,
         repeat_penalty: config.repeat_penalty,
-        n_predict: config.n_predict,
+        max_tokens: config.n_predict,
         seed: config.seed,
         n_ctx: config.n_ctx,
+        stream: true,
       }),
       signal: abortCtrl.signal,
     });
 
     if (!r.ok) throw new Error('HTTP ' + r.status);
-    const data = await r.json();
-    const assistant = messageHistory[messageHistory.length - 1];
-    assistant.content = data.text || '';
+    const reader = r.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    let fullText = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split('\n');
+      buf = lines.pop() || '';
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const data = line.slice(6).trim();
+        if (data === '[DONE]') break;
+        try {
+          const j = JSON.parse(data);
+          if (j.error) {
+            messageHistory[assistantIdx].content = 'Error: ' + j.error;
+            renderMessages();
+            continue;
+          }
+          const delta = j.choices?.[0]?.delta;
+          if (!delta) continue;
+          if (delta.content) {
+            fullText += delta.content;
+            messageHistory[assistantIdx].content = fullText;
+            renderMessages();
+          }
+        } catch {}
+      }
+    }
+
+    // fullText already accumulated via streaming deltas
+    if (!fullText) {
+      messageHistory[assistantIdx].content = '(no output)';
+    }
     renderMessages();
   } catch (e) {
     if (e.name !== 'AbortError') {
-      const assistant = messageHistory[messageHistory.length - 1];
-      assistant.content = 'Error: ' + e.message;
+      messageHistory[assistantIdx].content = 'Error: ' + e.message;
       renderMessages();
     }
   } finally {
@@ -167,6 +202,7 @@ async function sendMessage() {
     abortCtrl = null;
     $('sendBtn').classList.remove('hidden');
     $('stopBtn').classList.add('hidden');
+    fetchTelemetry();
   }
 }
 
@@ -174,26 +210,33 @@ function stopGeneration() {
   if (abortCtrl) abortCtrl.abort();
 }
 
+function newSession() {
+  if (streaming) abortCtrl?.abort();
+  messageHistory = [];
+  renderMessages();
+}
+
 function renderMessages() {
   const container = $('chatMessages');
   container.innerHTML = '';
+  if (messageHistory.length === 0) {
+    container.innerHTML = '<div class="empty-chat"><p class="muted">Send a message to start.</p></div>';
+    return;
+  }
   for (const m of messageHistory) {
     const div = document.createElement('div');
     div.className = 'msg msg-' + m.role;
+    const role = document.createElement('div');
+    role.className = 'msg-role';
+    role.textContent = m.role === 'user' ? 'You' : 'Assistant';
+    div.appendChild(role);
     const bubble = document.createElement('div');
     bubble.className = 'msg-bubble';
-    if (m.role === 'assistant') {
-      const role = document.createElement('div');
-      role.className = 'msg-role';
-      role.textContent = 'Assistant';
-      div.appendChild(role);
-    }
-    const content = document.createElement('div');
-    content.textContent = m.content;
+    bubble.textContent = m.content;
     if (streaming && m.role === 'assistant' && m.content === '') {
-      content.className = 'typing-cursor';
+      bubble.className = 'msg-bubble typing-cursor';
+      bubble.textContent = ' ';
     }
-    bubble.appendChild(content);
     div.appendChild(bubble);
     container.appendChild(div);
   }
@@ -220,15 +263,11 @@ async function fetchTelemetry() {
     const grid = $('telemetryGrid');
     grid.innerHTML = '';
     const metrics = [
-      { label: 'Model', value: d.model || '-', },
-      { label: 'RAM (RSS)', value: d.rss_mb || '-', unit: 'MB' },
-      { label: 'Tokens/s', value: d.tokens_per_sec?.toFixed(2) || '-' },
+      { label: 'Model', value: d.model || '-' },
+      { label: 'Server RAM', value: d.rss_mb || '-', unit: 'MB' },
+      { label: 'Last Speed', value: d.last_tps || '-', unit: 'tok/s' },
+      { label: 'Last Time', value: d.last_elapsed || '-', unit: 's' },
       { label: 'Total Tokens', value: d.total_tokens || 0 },
-      { label: 'Expert Tensors', value: d.expert_tensors || 0 },
-      { label: 'Trunk Buffer', value: d.trunk_mb || '-', unit: 'MB' },
-      { label: 'Architecture', value: d.arch || '-' },
-      { label: 'Layers', value: d.n_layers || '-' },
-      { label: 'Experts', value: d.n_experts || '-', },
     ];
     for (const m of metrics) {
       const card = document.createElement('div');
@@ -236,9 +275,7 @@ async function fetchTelemetry() {
       card.innerHTML = `<span class="metric-label">${m.label}</span><span class="metric-value">${m.value}${m.unit ? ' <span class="metric-unit">' + m.unit + '</span>' : ''}</span>`;
       grid.appendChild(card);
     }
-  } catch (e) {
-    console.error('telemetry:', e);
-  }
+  } catch (e) { console.error('telemetry:', e); }
 }
 
 async function fetchMemory() {
@@ -249,7 +286,7 @@ async function fetchMemory() {
     const container = $('memoryContent');
     container.innerHTML = '';
     if (!d.layers || d.layers.length === 0) {
-      container.innerHTML = '<p class="muted">No model loaded.</p>';
+      container.innerHTML = '<p class="muted">No model loaded. Load a model to inspect KV cache and recurrent state.</p>';
       return;
     }
     for (const layer of d.layers) {
@@ -258,9 +295,7 @@ async function fetchMemory() {
       entry.innerHTML = `Layer ${layer.idx}: type=${layer.type}, KV cache=${layer.kv_entries || 0}, state=${layer.state_size || 0}B`;
       container.appendChild(entry);
     }
-  } catch (e) {
-    console.error('memory:', e);
-  }
+  } catch (e) { console.error('memory:', e); }
 }
 
 function renderSettings() {
@@ -284,6 +319,13 @@ function renderSettings() {
       <div class="setting-hint"><span id="val-${s.key}">${config[s.key]}</span> | ${s.hint}</div>`;
     panel.appendChild(row);
   }
+  // New session button
+  const ns = document.createElement('button');
+  ns.className = 'btn btn-danger';
+  ns.textContent = 'Clear Chat History';
+  ns.onclick = newSession;
+  ns.style.marginTop = '8px';
+  panel.appendChild(ns);
 }
 
 function updateSetting(key, val, step) {
@@ -293,11 +335,11 @@ function updateSetting(key, val, step) {
 
 function formatBytes(bytes) {
   if (!bytes) return '-';
-  if (bytes < 1024) return bytes + 'B';
   if (bytes < 1048576) return (bytes / 1024).toFixed(0) + 'KB';
   if (bytes < 1073741824) return (bytes / 1048576).toFixed(0) + 'MB';
   return (bytes / 1073741824).toFixed(2) + 'GB';
 }
 
+renderMessages();
 setInterval(checkHealth, 5000);
 checkHealth();

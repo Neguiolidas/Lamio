@@ -113,6 +113,7 @@ int main(int argc, char ** argv) {
     std::string prompt_text;
     lamio::SamplerConfig sampler_cfg;
     unsigned int rng_seed = 0;
+    std::vector<int> stop_tokens;
 
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--info") == 0) {
@@ -140,6 +141,8 @@ int main(int argc, char ** argv) {
             if (i + 1 < argc) sampler_cfg.repeat_penalty = std::stof(argv[++i]);
         } else if (std::strcmp(argv[i], "--seed") == 0) {
             if (i + 1 < argc) rng_seed = (unsigned)std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--stop-token") == 0) {
+            if (i + 1 < argc) stop_tokens.push_back(std::atoi(argv[++i]));
         } else if (std::strcmp(argv[i], "--max-layers") == 0) {
             if (i + 1 < argc) ++i; // skip the value
         } else {
@@ -866,7 +869,21 @@ int main(int argc, char ** argv) {
             }
 
             std::printf("[%d] token=%d logit=%.4f\n", gen_step, best_id, best_val);
+            // Also print decoded token piece for streaming
+            std::string piece = tok.decode({best_id});
+            std::printf("piece:%s\n", piece.c_str());
+            std::fflush(stdout);
             all_ids.push_back(best_id);
+
+            // Check stop tokens
+            bool should_stop = false;
+            for (int st : stop_tokens) {
+                if (best_id == st) { should_stop = true; break; }
+            }
+            if (should_stop) {
+                std::fprintf(stderr, "stop token %d reached\n", best_id);
+                break;
+            }
 
             ggml_free(ictx);
             free(ibuf);
