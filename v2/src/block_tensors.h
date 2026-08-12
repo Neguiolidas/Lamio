@@ -32,8 +32,22 @@ struct BlockTensors {
     TensorRef attn_k     = {};
     TensorRef attn_v     = {};
     TensorRef attn_qkv   = {};  // fused QKV (hybrid/GQA models)
+    TensorRef attn_gate  = {};  // wqkv_gate (delta net) or QG gate
+    TensorRef attn_q_norm = {}; // per-head Q norm
+    TensorRef attn_k_norm = {}; // per-head K norm
+    TensorRef attn_qkv_gate = {}; // gated delta net z projection
     TensorRef attn_output = {};
     TensorRef attn_norm   = {};  // pre-attention norm
+    TensorRef attn_post_norm = {}; // post-attention norm (before FFN)
+
+    // linear attention / delta net (SSM-style)
+    TensorRef ssm_conv1d  = {};
+    TensorRef ssm_dt      = {};  // bias
+    TensorRef ssm_a       = {};
+    TensorRef ssm_alpha   = {};
+    TensorRef ssm_beta    = {};
+    TensorRef ssm_norm    = {};
+    TensorRef ssm_out     = {};
 
     // FFN (dense)
     TensorRef ffn_gate   = {};

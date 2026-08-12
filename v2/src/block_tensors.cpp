@@ -34,8 +34,21 @@ static void scan_block(const GgufReader & r, BlockTensors & blk) {
     find_in_block("attn_k.weight", blk.attn_k);
     find_in_block("attn_v.weight", blk.attn_v);
     find_in_block("attn_qkv.weight", blk.attn_qkv);
+    find_in_block("attn_gate.weight", blk.attn_gate);
     find_in_block("attn_output.weight", blk.attn_output);
     find_in_block("attn_norm.weight", blk.attn_norm);
+    find_in_block("attn_q_norm.weight", blk.attn_q_norm);
+    find_in_block("attn_k_norm.weight", blk.attn_k_norm);
+    find_in_block("attn_post_norm.weight", blk.attn_post_norm);
+
+    // linear attention / delta net tensors
+    find_in_block("ssm_conv1d.weight", blk.ssm_conv1d);
+    find_in_block("ssm_dt.bias", blk.ssm_dt);
+    find_in_block("ssm_a", blk.ssm_a);
+    find_in_block("ssm_alpha.weight", blk.ssm_alpha);
+    find_in_block("ssm_beta.weight", blk.ssm_beta);
+    find_in_block("ssm_norm.weight", blk.ssm_norm);
+    find_in_block("ssm_out.weight", blk.ssm_out);
 
     // Dense FFN: many architectures name the pre-FFN norm differently.
     find_in_block("ffn_gate.weight", blk.ffn_gate);
@@ -76,8 +89,20 @@ ModelTensors map_tensors(const GgufReader & r, int n_layers) {
         mt.blocks[l].attn_q.tensor_idx = -1;
         mt.blocks[l].attn_k.tensor_idx = -1;
         mt.blocks[l].attn_v.tensor_idx = -1;
+        mt.blocks[l].attn_qkv.tensor_idx = -1;
+        mt.blocks[l].attn_gate.tensor_idx = -1;
+        mt.blocks[l].attn_q_norm.tensor_idx = -1;
+        mt.blocks[l].attn_k_norm.tensor_idx = -1;
         mt.blocks[l].attn_output.tensor_idx = -1;
         mt.blocks[l].attn_norm.tensor_idx = -1;
+        mt.blocks[l].attn_post_norm.tensor_idx = -1;
+        mt.blocks[l].ssm_conv1d.tensor_idx = -1;
+        mt.blocks[l].ssm_dt.tensor_idx = -1;
+        mt.blocks[l].ssm_a.tensor_idx = -1;
+        mt.blocks[l].ssm_alpha.tensor_idx = -1;
+        mt.blocks[l].ssm_beta.tensor_idx = -1;
+        mt.blocks[l].ssm_norm.tensor_idx = -1;
+        mt.blocks[l].ssm_out.tensor_idx = -1;
         mt.blocks[l].ffn_gate.tensor_idx = -1;
         mt.blocks[l].ffn_up.tensor_idx = -1;
         mt.blocks[l].ffn_down.tensor_idx = -1;

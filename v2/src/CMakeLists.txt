@@ -5,6 +5,7 @@ add_library(lamio_core STATIC
     tokenizer.cpp
     weight_loader.cpp
     dense_forward.cpp
+    qwen35_forward.cpp
 )
 
 target_include_directories(lamio_core PUBLIC

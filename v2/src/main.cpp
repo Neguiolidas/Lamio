@@ -1,3 +1,4 @@
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -9,10 +10,10 @@
 #include "tokenizer.h"
 #include "weight_loader.h"
 #include "dense_forward.h"
+#include "qwen35_forward.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
-#include "ggml-alloc.h"
 #include "ggml-cpu.h"
 
 static void print_info(const char * path) {
@@ -115,6 +116,11 @@ int main(int argc, char ** argv) {
             list_mode = true;
         } else if (std::strcmp(argv[i], "--generate") == 0) {
             generate_mode = true;
+        } else if (std::strcmp(argv[i], "--n-gen") == 0) {
+            // consumed in generate loop below
+            if (i + 1 < argc) ++i; // skip the value
+        } else if (std::strcmp(argv[i], "--max-layers") == 0) {
+            if (i + 1 < argc) ++i; // skip the value
         } else {
             model_path = argv[i];
         }
@@ -140,9 +146,15 @@ int main(int argc, char ** argv) {
         return 0;
     }
 
-    // --generate: forward pass smoke test
+    // --qwen35-generate: full forward pass with attention + delta net
     std::string gen_prompt = prompt_text;
     if (gen_prompt.empty()) gen_prompt = "Hello";
+    int n_gen_tokens = 8;
+    int max_layers = -1;  // -1 = all
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--max-layers") == 0 && i + 1 < argc) max_layers = atoi(argv[++i]);
+        if (std::strcmp(argv[i], "--n-gen") == 0 && i + 1 < argc) n_gen_tokens = atoi(argv[++i]);
+    }
     if (generate_mode) {
         lamio::GgufReader r(model_path);
         if (!r.ok()) { std::fprintf(stderr, "lamio: %s\n", r.error().c_str()); return 1; }
@@ -152,119 +164,362 @@ int main(int argc, char ** argv) {
         lamio::BpeTokenizer tok;
         if (!tok.load(r)) { std::fprintf(stderr, "lamio: tokenizer load failed\n"); return 1; }
 
-        std::vector<int32_t> prompt_ids = tok.encode(gen_prompt);
-        if (prompt_ids.empty()) { std::fprintf(stderr, "lamio: empty prompt\n"); return 1; }
+        std::vector<int32_t> all_ids = tok.encode(gen_prompt);
+        if (all_ids.empty()) { std::fprintf(stderr, "lamio: empty prompt\n"); return 1; }
         std::printf("prompt: %s\n", gen_prompt.c_str());
-        std::printf("tokens: %zu\n", prompt_ids.size());
+        std::printf("tokens: %zu\n", all_ids.size());
+
+        // Parse qwen35 hparams
+        lamio::Qwen35HParams hp = lamio::parse_qwen35_hparams(cfg, r);
 
         // ggml setup
         ggml_backend_t backend = ggml_backend_cpu_init();
         if (!backend) { std::fprintf(stderr, "lamio: backend init failed\n"); return 1; }
 
-        // Weight context: metadata only. Data allocated on backend via
-        // ggml_backend_alloc_ctx_tensors after all tensors are created.
-        size_t wpool = ggml_tensor_overhead() * 1024 + 16*1024*1024;
+        // Weight context
+        size_t wpool = ggml_tensor_overhead() * 2048 + 32*1024*1024;
         void * wbuf = malloc(wpool);
         struct ggml_init_params wparams = { wpool, wbuf, true };
         ggml_context * wctx = ggml_init(wparams);
-        if (!wctx) { std::fprintf(stderr, "lamio: weight ctx init failed\n"); return 1; }
         lamio::WeightLoader wl(backend, wctx, r);
 
-        // Create all weight tensors (metadata only, no data yet).
+        // Create ALL weight tensors (attention + FFN + delta net + norms)
         ggml_tensor * embd_w = wl.load(mt.global.token_embd);
-        if (!embd_w) { std::fprintf(stderr, "lamio: token_embd load failed\n"); return 1; }
-
-        // Pre-create block weights (DenseForward loads ffn_norm/gate/up/down).
         for (int l = 0; l < cfg.n_layers; ++l) {
-            if (mt.blocks[l].has_moe) continue;  // phase 3: dense only
-            if (mt.blocks[l].ffn_norm.tensor_idx >= 0) wl.load(mt.blocks[l].ffn_norm);
-            if (mt.blocks[l].ffn_gate.tensor_idx >= 0) wl.load(mt.blocks[l].ffn_gate);
-            if (mt.blocks[l].ffn_up.tensor_idx >= 0)   wl.load(mt.blocks[l].ffn_up);
-            if (mt.blocks[l].ffn_down.tensor_idx >= 0) wl.load(mt.blocks[l].ffn_down);
+            const auto & b = mt.blocks[l];
+            bool is_recr = (l + 1) % 4 != 0;  // qwen35 default
+            if (is_recr) {
+                // delta net layer
+                if (b.attn_norm.tensor_idx >= 0) wl.load(b.attn_norm);
+                if (b.attn_post_norm.tensor_idx >= 0) wl.load(b.attn_post_norm);
+                if (b.attn_qkv.tensor_idx >= 0) wl.load(b.attn_qkv);
+                if (b.attn_gate.tensor_idx >= 0) wl.load(b.attn_gate);
+                if (b.ssm_conv1d.tensor_idx >= 0) wl.load(b.ssm_conv1d);
+                if (b.ssm_dt.tensor_idx >= 0) wl.load(b.ssm_dt);
+                if (b.ssm_a.tensor_idx >= 0) wl.load(b.ssm_a);
+                if (b.ssm_alpha.tensor_idx >= 0) wl.load(b.ssm_alpha);
+                if (b.ssm_beta.tensor_idx >= 0) wl.load(b.ssm_beta);
+                if (b.ssm_norm.tensor_idx >= 0) wl.load(b.ssm_norm);
+                if (b.ssm_out.tensor_idx >= 0) wl.load(b.ssm_out);
+            } else {
+                // standard attention layer
+                if (b.attn_norm.tensor_idx >= 0) wl.load(b.attn_norm);
+                if (b.attn_post_norm.tensor_idx >= 0) wl.load(b.attn_post_norm);
+                if (b.attn_q.tensor_idx >= 0) wl.load(b.attn_q);
+                if (b.attn_k.tensor_idx >= 0) wl.load(b.attn_k);
+                if (b.attn_v.tensor_idx >= 0) wl.load(b.attn_v);
+                if (b.attn_output.tensor_idx >= 0) wl.load(b.attn_output);
+                if (b.attn_q_norm.tensor_idx >= 0) wl.load(b.attn_q_norm);
+                if (b.attn_k_norm.tensor_idx >= 0) wl.load(b.attn_k_norm);
+            }
+            // FFN (all layers)
+            if (b.ffn_gate.tensor_idx >= 0) wl.load(b.ffn_gate);
+            if (b.ffn_up.tensor_idx >= 0) wl.load(b.ffn_up);
+            if (b.ffn_down.tensor_idx >= 0) wl.load(b.ffn_down);
+            if (b.ffn_norm.tensor_idx >= 0) wl.load(b.ffn_norm);
         }
-        // Output weights
         if (mt.global.output_norm.tensor_idx >= 0) wl.load(mt.global.output_norm);
         if (mt.global.output_weight.tensor_idx >= 0) wl.load(mt.global.output_weight);
 
-        // Allocate all weight tensors on the backend.
         ggml_backend_buffer_t wbackend_buf = ggml_backend_alloc_ctx_tensors(wctx, backend);
         if (!wbackend_buf) { std::fprintf(stderr, "lamio: weight alloc failed\n"); return 1; }
-
-        // Load weight data from file into backend tensors.
         size_t loaded = wl.load_all_data();
         std::printf("loaded %zu weight tensors\n", loaded);
-        std::printf("embd: [%lld %lld] type=%d\n",
-                    (long long)embd_w->ne[0], (long long)embd_w->ne[1], (int)embd_w->type);
 
-        // compute context (graph tensors, no_alloc=true so gallocr handles data)
-        size_t compute_ctx_size = 128 * 1024 * 1024;  // 128MB arena
-        void * cbuf = malloc(compute_ctx_size);
-        struct ggml_init_params cparams = { compute_ctx_size, cbuf, true };
-        ggml_context * cctx = ggml_init(cparams);
-
-        // embedding lookup: create input token-id tensor, allocate + set data
-        int32_t first_id = prompt_ids[0];
-        ggml_tensor * idx = ggml_new_tensor_1d(cctx, GGML_TYPE_I32, 1);
-        ggml_backend_buffer_t input_buf = ggml_backend_alloc_ctx_tensors(cctx, backend);
-        if (!input_buf) { std::fprintf(stderr, "lamio: input alloc failed\n"); return 1; }
-        ggml_backend_tensor_set(idx, &first_id, 0, sizeof(int32_t));
-        ggml_tensor * x = ggml_get_rows(cctx, embd_w, idx);
-
-        // Forward through all blocks (FFN only, no attention yet)
-        for (int l = 0; l < cfg.n_layers; ++l) {
-            lamio::DenseForward df{cfg, wl, backend, cctx, 4};
-            x = df.forward(mt.blocks[l], x);
-            if (!x) { std::fprintf(stderr, "lamio: forward block %d failed\n", l); return 1; }
-        }
-
-        // output norm + output weight -> logits
-        if (mt.global.output_norm.tensor_idx >= 0) {
-            ggml_tensor * norm_w = wl.load(mt.global.output_norm);
-            if (norm_w) {
-                x = ggml_rms_norm(cctx, x, cfg.norm_eps);
-                x = ggml_mul(cctx, x, norm_w);
-            }
-        }
-        ggml_tensor * output_w = wl.load(mt.global.output_weight);
-        if (!output_w) output_w = embd_w;  // tied
-        ggml_tensor * logits = ggml_mul_mat(cctx, output_w, x);
-
-        // build graph
-        ggml_cgraph * gf = ggml_new_graph(cctx);
-        ggml_build_forward_expand(gf, logits);
-
-        // allocate compute tensors via gallocr (no_alloc ctx + backend)
-        ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
-        if (!galloc || !ggml_gallocr_alloc_graph(galloc, gf)) {
-            std::fprintf(stderr, "lamio: gallocr alloc failed\n");
-            if (galloc) ggml_gallocr_free(galloc);
+        // Create the backend scheduler (reused across all gen steps)
+        ggml_backend_t sched_backends[1] = { backend };
+        ggml_backend_buffer_type_t sched_bufts[1] = { ggml_backend_cpu_buffer_type() };
+        ggml_backend_sched_t sched = ggml_backend_sched_new(
+            sched_backends, sched_bufts, 1, 16384, false, false);
+        if (!sched) {
+            std::fprintf(stderr, "lamio: failed to create backend scheduler\n");
             return 1;
         }
 
-        // compute
-        ggml_status status = ggml_backend_graph_compute(backend, gf);
-        if (status != GGML_STATUS_SUCCESS) { std::fprintf(stderr, "lamio: compute failed\n"); return 1; }
+        // -------------------------------------------------------------------
+        // Persistent state buffers (kept across all generation steps)
+        // For GDN layers: conv_state [d_conv-1, conv_channels, 1] + ssm_state [S_v, S_v, H_v, 1]
+        // For attn layers: kv_k [head_dim, n_head_kv, max_ctx] + kv_v [head_dim, n_head_kv, max_ctx]
+        // -------------------------------------------------------------------
+        const int conv_kernel   = hp.ssm_d_conv;
+        const int conv_channels = hp.conv_dim();
+        const int head_v_dim    = hp.head_v_dim();
+        const int num_v_heads   = hp.num_v_heads();
+        const int head_dim_attn = hp.head_dim;
+        const int n_head_kv     = hp.n_head_kv;
+        const int max_ctx       = 4096;
 
-        // read logits: argmax of last token
-        // After compute, logits data is in backend buffer. Read it back.
-        std::vector<float> logits_buf(cfg.vocab_size);
-        ggml_backend_tensor_get(logits, logits_buf.data(), 0,
-                                cfg.vocab_size * sizeof(float));
-        float * logits_data = logits_buf.data();
+        // Allocate persistent backend buffers
+        auto make_persistent = [&](ggml_type type, std::initializer_list<int64_t> ne) -> ggml_tensor * {
+            size_t meta_sz = ggml_tensor_overhead() * 2 + 1024;
+            void * mb = malloc(meta_sz);
+            struct ggml_init_params mp = { meta_sz, mb, true };
+            ggml_context * mc = ggml_init(mp);
+            ggml_tensor * t;
+            if (ne.size() == 3) t = ggml_new_tensor_3d(mc, type, ne.begin()[0], ne.begin()[1], ne.begin()[2]);
+            else if (ne.size() == 4) t = ggml_new_tensor_4d(mc, type, ne.begin()[0], ne.begin()[1], ne.begin()[2], ne.begin()[3]);
+            else t = ggml_new_tensor_2d(mc, type, ne.begin()[0], ne.begin()[1]);
+            // Allocate buffer and bind tensor to it
+            ggml_backend_buffer_t b = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), ggml_nbytes(t) + 256);
+            ggml_backend_tensor_alloc(b, t, (char *)ggml_backend_buffer_get_base(b));
+            ggml_backend_tensor_memset(t, 0, 0, ggml_nbytes(t));
+            return t;
+        };
 
-        int32_t best_id = 0;
-        float best_val = -1e30f;
-        for (int i = 0; i < cfg.vocab_size; ++i) {
-            if (logits_data[i] > best_val) { best_val = logits_data[i]; best_id = i; }
+        std::vector<ggml_tensor *> p_conv_state(cfg.n_layers, nullptr);
+        std::vector<ggml_tensor *> p_ssm_state(cfg.n_layers, nullptr);
+        std::vector<ggml_tensor *> p_kv_k(cfg.n_layers, nullptr);
+        std::vector<ggml_tensor *> p_kv_v(cfg.n_layers, nullptr);
+        int kv_pos = 0;
+
+        for (int l = 0; l < cfg.n_layers; ++l) {
+            bool is_recr = (l + 1) % 4 != 0;
+            if (is_recr) {
+                p_conv_state[l] = make_persistent(GGML_TYPE_F32, {conv_kernel - 1, conv_channels, 1});
+                p_ssm_state[l]  = make_persistent(GGML_TYPE_F32, {head_v_dim, head_v_dim, num_v_heads, 1});
+            } else {
+                p_kv_k[l] = make_persistent(GGML_TYPE_F16, {head_dim_attn, n_head_kv, max_ctx});
+                p_kv_v[l] = make_persistent(GGML_TYPE_F16, {head_dim_attn, n_head_kv, max_ctx});
+            }
         }
-        std::printf("next token: %d (logit=%.4f)\n", best_id, best_val);
-        std::printf("decoded: %s\n", tok.decode({best_id}).c_str());
 
-        // cleanup
-        ggml_backend_buffer_free(input_buf);
-        ggml_gallocr_free(galloc);
-        ggml_free(cctx);
-        free(cbuf);
+        // -------------------------------------------------------------------
+        // Generation loop: step 0 = prefill (all prompt tokens),
+        // steps 1+ = decode (1 token per step)
+        // -------------------------------------------------------------------
+        for (int gen_step = 0; gen_step < n_gen_tokens; ++gen_step) {
+            bool is_prefill = (gen_step == 0);
+            int n_tokens = is_prefill ? (int)all_ids.size() : 1;
+
+            // Compute context (recreated each step)
+            size_t compute_ctx_size = 256 * 1024 * 1024;
+            void * cbuf = malloc(compute_ctx_size);
+            struct ggml_init_params cparams = { compute_ctx_size, cbuf, true };
+            ggml_context * cctx = ggml_init(cparams);
+
+            // Input context
+            size_t ictx_size = ggml_tensor_overhead() * 64 + 128 * 1024 * 1024;
+            void * ibuf = malloc(ictx_size);
+            struct ggml_init_params iparams = { ictx_size, ibuf, true };
+            ggml_context * ictx = ggml_init(iparams);
+
+            // Position IDs
+            int32_t pos_base = is_prefill ? 0 : (int)all_ids.size() - 1;
+            std::vector<int32_t> pos_data(n_tokens);
+            for (int i = 0; i < n_tokens; ++i) pos_data[i] = pos_base + i;
+
+            // Create input tensors in ictx
+            ggml_tensor * idx = ggml_new_tensor_1d(ictx, GGML_TYPE_I32, n_tokens);
+            ggml_set_input(idx);
+            ggml_tensor * pos_ids = ggml_new_tensor_1d(ictx, GGML_TYPE_I32, n_tokens);
+            ggml_set_input(pos_ids);
+            // Mask: only needed for prefill (causal). For decode (1 token), no mask needed.
+            ggml_tensor * mask = nullptr;
+            if (is_prefill) {
+                mask = ggml_new_tensor_2d(ictx, GGML_TYPE_F16, n_tokens, n_tokens);
+                ggml_set_input(mask);
+            }
+
+            // Embedding lookup
+            std::vector<int32_t> cur_ids(all_ids.end() - n_tokens, all_ids.end());
+            ggml_tensor * x = ggml_get_rows(cctx, embd_w, idx);
+            ggml_set_output(x);
+            ggml_set_input(x);
+
+            // Forward through all layers
+            const int lim = (max_layers < 0 || max_layers > cfg.n_layers) ? cfg.n_layers : max_layers;
+            std::vector<ggml_tensor *> all_zero_init;
+            std::vector<lamio::LayerState> layer_states(lim);
+
+            for (int l = 0; l < lim; ++l) {
+                bool is_recr = (l + 1) % 4 != 0;
+                lamio::Qwen35Forward fwd{cfg, hp, wl, cctx, is_recr};
+
+                lamio::LayerState & ls = layer_states[l];
+                ls.want_state = (p_conv_state[l] != nullptr);  // always extract state for GDN layers
+                if (is_recr) {
+                    // GDN: create input tensors for decode (prefill uses zeros)
+                    if (!is_prefill && p_conv_state[l]) {
+                        ggml_tensor * cs_in = ggml_new_tensor_3d(ictx, GGML_TYPE_F32,
+                            conv_kernel - 1, conv_channels, 1);
+                        ggml_set_input(cs_in);
+                        ls.conv_state_in = cs_in;
+                    }
+                    if (!is_prefill && p_ssm_state[l]) {
+                        ggml_tensor * ss_in = ggml_new_tensor_4d(ictx, GGML_TYPE_F32,
+                            head_v_dim, head_v_dim, num_v_heads, 1);
+                        ggml_set_input(ss_in);
+                        ls.ssm_state_in = ss_in;
+                    }
+                    // Output tensors created as graph results (in cctx) by build_layer_attn_linear
+                    // via ggml_cpy. We expand them into the graph and read them post-compute.
+                } else {
+                    // Attention: KV cache
+                    if (!is_prefill && p_kv_k[l] && kv_pos > 0) {
+                        ggml_tensor * kk_in = ggml_view_3d(ictx, p_kv_k[l],
+                            head_dim_attn, n_head_kv, kv_pos,
+                            p_kv_k[l]->nb[1], p_kv_k[l]->nb[2], 0);
+                        ggml_set_input(kk_in);
+                        ls.kv_k_in = kk_in;
+                        ggml_tensor * vv_in = ggml_view_3d(ictx, p_kv_v[l],
+                            head_dim_attn, n_head_kv, kv_pos,
+                            p_kv_v[l]->nb[1], p_kv_v[l]->nb[2], 0);
+                        ggml_set_input(vv_in);
+                        ls.kv_v_in = vv_in;
+                    }
+                    // KV output: write directly into persistent buffer via view
+                    if (p_kv_k[l]) {
+                        int out_pos = is_prefill ? 0 : kv_pos;
+                        ggml_tensor * kk_out = ggml_view_3d(ictx, p_kv_k[l],
+                            head_dim_attn, n_head_kv, out_pos + n_tokens,
+                            p_kv_k[l]->nb[1], p_kv_k[l]->nb[2], 0);
+                        ggml_set_output(kk_out);
+                        ls.kv_k_out = kk_out;
+                        ggml_tensor * vv_out = ggml_view_3d(ictx, p_kv_v[l],
+                            head_dim_attn, n_head_kv, out_pos + n_tokens,
+                            p_kv_v[l]->nb[1], p_kv_v[l]->nb[2], 0);
+                        ggml_set_output(vv_out);
+                        ls.kv_v_out = vv_out;
+                    }
+                }
+
+                x = fwd.build_layer(x, mt.blocks[l], pos_ids, mask, &ls);
+                if (!x) { std::fprintf(stderr, "lamio: forward block %d failed\n", l); break; }
+                for (auto * t : fwd.zero_init) all_zero_init.push_back(t);
+            }
+
+            // output norm + output weight -> logits
+            ggml_tensor * out_norm_w = wl.load(mt.global.output_norm);
+            if (out_norm_w) {
+                x = ggml_rms_norm(cctx, x, cfg.norm_eps);
+                x = ggml_mul(cctx, x, out_norm_w);
+            }
+            ggml_tensor * output_w = wl.load(mt.global.output_weight);
+            if (!output_w) output_w = embd_w;
+            ggml_tensor * logits = ggml_mul_mat(cctx, output_w, x);
+            ggml_set_output(logits);
+
+            // Build graph
+            ggml_cgraph * gf = ggml_new_graph(cctx);
+            ggml_build_forward_expand(gf, logits);
+
+            // Also expand state output tensors into the graph (they are separate from logits)
+            for (int l = 0; l < lim; ++l) {
+                auto & ls = layer_states[l];
+                if (ls.conv_state_out) ggml_build_forward_expand(gf, ls.conv_state_out);
+                if (ls.ssm_state_out)  ggml_build_forward_expand(gf, ls.ssm_state_out);
+                if (ls.kv_k_out)       ggml_build_forward_expand(gf, ls.kv_k_out);
+                if (ls.kv_v_out)       ggml_build_forward_expand(gf, ls.kv_v_out);
+            }
+
+            // Reset scheduler and allocate graph
+            ggml_backend_sched_reset(sched);
+            if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+                std::fprintf(stderr, "lamio: sched alloc failed (step %d)\n", gen_step);
+                ggml_free(cctx); free(cbuf);
+                ggml_free(ictx); free(ibuf);
+                break;
+            }
+
+            // Set input data
+            ggml_backend_tensor_set(idx, cur_ids.data(), 0, n_tokens * sizeof(int32_t));
+            ggml_backend_tensor_set(pos_ids, pos_data.data(), 0, n_tokens * sizeof(int32_t));
+            if (mask) {
+                std::vector<uint16_t> mask_data(n_tokens * n_tokens, 0);
+                for (int i = 0; i < n_tokens; ++i)
+                    for (int j = 0; j < n_tokens; ++j)
+                        mask_data[i * n_tokens + j] = (j <= i) ? 0x0000 : 0xFC00;
+                ggml_backend_tensor_set(mask, mask_data.data(), 0,
+                    n_tokens * n_tokens * sizeof(uint16_t));
+            }
+
+            // Copy persistent state INTO graph input tensors (decode only)
+            if (!is_prefill) {
+                for (int l = 0; l < lim; ++l) {
+                    bool is_recr = (l + 1) % 4 != 0;
+                    auto & ls = layer_states[l];
+                    if (is_recr) {
+                        if (ls.conv_state_in && p_conv_state[l])
+                            ggml_backend_tensor_copy(p_conv_state[l], ls.conv_state_in);
+                        if (ls.ssm_state_in && p_ssm_state[l])
+                            ggml_backend_tensor_copy(p_ssm_state[l], ls.ssm_state_in);
+                    } else {
+                        // KV cache views are views into p_kv_k/v, data is already there
+                    }
+                }
+            }
+
+            // Zero-init state/pad tensors (fresh buffers from sched)
+            for (auto * t : all_zero_init) {
+                if (t && t->buffer) ggml_backend_tensor_memset(t, 0, 0, ggml_nbytes(t));
+            }
+
+            // Compute
+            ggml_status status = ggml_backend_sched_graph_compute(sched, gf);
+            if (status != GGML_STATUS_SUCCESS) {
+                std::fprintf(stderr, "lamio: compute failed (step %d)\n", gen_step);
+                ggml_free(cctx); free(cbuf);
+                ggml_free(ictx); free(ibuf);
+                break;
+            }
+
+            // Copy persistent state FROM graph output tensors (for next step)
+            {
+                for (int l = 0; l < lim; ++l) {
+                    bool is_recr = (l + 1) % 4 != 0;
+                    auto & ls = layer_states[l];
+                    if (is_recr) {
+                        // conv_state_out and ssm_state_out are ggml_cpy results in cctx
+                        if (ls.conv_state_out && p_conv_state[l])
+                            ggml_backend_tensor_copy(ls.conv_state_out, p_conv_state[l]);
+                        if (ls.ssm_state_out && p_ssm_state[l])
+                            ggml_backend_tensor_copy(ls.ssm_state_out, p_ssm_state[l]);
+                    }
+                    // KV cache: output views are views into p_kv_k/v, data is already written
+                }
+                if (is_prefill) {
+                    kv_pos = n_tokens;
+                } else {
+                    kv_pos++;
+                }
+            }
+
+            // Read logits of last token
+            std::vector<float> logits_buf(cfg.vocab_size);
+            ggml_backend_tensor_get(logits, logits_buf.data(),
+                (n_tokens - 1) * cfg.vocab_size * sizeof(float),
+                cfg.vocab_size * sizeof(float));
+
+            int32_t best_id = 0;
+            float best_val = -1e30f;
+            for (int i = 0; i < cfg.vocab_size; ++i) {
+                if (logits_buf[i] > best_val) { best_val = logits_buf[i]; best_id = i; }
+            }
+
+            if (gen_step == 0)
+                std::fprintf(stderr, "  logits: best=%d(%.4f) tok11=%.4f tok198=%.4f\n",
+                    best_id, best_val, logits_buf[11], logits_buf[198]);
+
+            std::printf("[%d] token=%d logit=%.4f\n", gen_step, best_id, best_val);
+            all_ids.push_back(best_id);
+
+            ggml_free(ictx);
+            free(ibuf);
+            ggml_free(cctx);
+            free(cbuf);
+        }
+
+        ggml_backend_sched_free(sched);
+
+        // Decode all generated tokens
+        std::printf("\ndecoded: ");
+        std::string result;
+        for (size_t i = 0; i < all_ids.size(); ++i) {
+            std::string piece = tok.decode({all_ids[i]});
+            result += piece;
+        }
+        std::printf("%s\n", result.c_str());
+
         ggml_backend_buffer_free(wbackend_buf);
         ggml_free(wctx);
         free(wbuf);
@@ -280,7 +535,19 @@ int main(int argc, char ** argv) {
             std::printf("%d\t%s\tne=[", (int)i, tensors[i].name.c_str());
             for (int d = 0; d < tensors[i].n_dims; ++d)
                 std::printf("%s%lld", d ? " " : "", (long long)tensors[i].ne[d]);
-            std::printf("]\n");
+            std::printf("]\ttype=%d\n", tensors[i].ggml_type);
+        }
+        return 0;
+    }
+
+    bool dump_mode = false;
+    for (int i = 1; i < argc; ++i)
+        if (std::strcmp(argv[i], "--dump-meta") == 0) dump_mode = true;
+    if (dump_mode) {
+        lamio::GgufReader r(model_path);
+        if (!r.ok()) { std::fprintf(stderr, "lamio: %s\n", r.error().c_str()); return 1; }
+        for (const auto & kv : r.metadata()) {
+            std::printf("%s = %s\n", kv.first.c_str(), kv.second.c_str());
         }
         return 0;
     }
