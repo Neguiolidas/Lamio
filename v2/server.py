@@ -43,18 +43,29 @@ def get_rss():
     return 0
 
 
-def build_chatml_prompt(messages, model_name=''):
-    """Build a prompt. For base (non-instruct) models, just concatenate user messages."""
+def build_chatml_prompt(messages, model_name='', chat_template=''):
+    """Build a prompt using the model's chat_template (Jinja2) if available."""
+    if chat_template:
+        try:
+            from jinja2 import Template
+            tmpl = Template(chat_template)
+            prompt = tmpl.render(
+                messages=messages,
+                add_generation_prompt=True,
+                enable_thinking=True,  # enable thinking so model generates reasoning before answer
+            )
+            return prompt
+        except Exception as e:
+            log.warning(f'jinja render failed: {e}, falling back to ChatML')
+
+    # Fallback: ChatML
     has_assistant = any(m.get('role') == 'assistant' for m in messages)
     if not has_assistant:
-        # Base model: just use the last user message as prompt
-        # History shown as context
         context = ''
         for msg in messages[:-1]:
             context += msg.get('content', '') + ' '
         prompt = context + messages[-1].get('content', '') if messages else ''
         return prompt
-    # Chat model: use ChatML
     prompt = ''
     for msg in messages:
         role = msg.get('role', 'user')
@@ -72,7 +83,7 @@ def build_chatml_prompt(messages, model_name=''):
 def parse_gguf_header(path):
     if path in _hdr_cache:
         return _hdr_cache[path]
-    info = {'arch': 'unknown', 'n_layers': 0, 'n_ctx': 0, 'n_experts': 0}
+    info = {'arch': 'unknown', 'n_layers': 0, 'n_ctx': 0, 'n_experts': 0, 'chat_template': ''}
     try:
         with open(path, 'rb') as f:
             magic = f.read(4)
@@ -100,6 +111,7 @@ def parse_gguf_header(path):
             info['n_layers'] = kvs.get(f'{arch}.block_count', 0)
             info['n_ctx'] = kvs.get(f'{arch}.context_length', 0)
             info['n_experts'] = kvs.get(f'{arch}.expert_count', 0)
+            info['chat_template'] = kvs.get('tokenizer.chat_template', '')
     except Exception as e:
         log.warning(f'parse_gguf_header({path}): {e}')
     _hdr_cache[path] = info
@@ -248,8 +260,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         stream = body.get('stream', True)
         stop_strings = body.get('stop', ['<|im_end|>', '</s>', '<|endoftext|>'])
 
-        # Build ChatML prompt
-        full_prompt = build_chatml_prompt(messages)
+        # Build ChatML prompt using model's chat_template (Jinja2)
+        hdr = parse_gguf_header(current_model) if current_model else {}
+        chat_template = hdr.get('chat_template', '')
+        full_prompt = build_chatml_prompt(messages, current_model_name or '', chat_template)
         truncated = False
 
         # Truncate if too long (rough: 4 chars ~= 1 token)
@@ -272,7 +286,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         args = [LAMIO_BIN, current_model, '--generate', '--prompt', full_prompt,
                 '--n-gen', str(n_predict), '--temp', str(temperature),
                 '--top-k', str(top_k), '--top-p', str(top_p),
-                '--repeat-penalty', str(repeat_penalty)]
+                '--repeat-penalty', str(repeat_penalty),
+                '--auto-stop']
         if seed and seed > 0:
             args.extend(['--seed', str(seed)])
 
@@ -295,10 +310,34 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     return
 
                 text = ''
+                # Collect piece: lines (only generated tokens, not prompt)
+                pieces = []
                 for line in result.stdout.splitlines():
-                    if line.startswith('decoded: '):
+                    if line.startswith('piece:'):
+                        pieces.append(line[6:])
+                    elif line.startswith('decoded: '):
                         text = line[9:]
-                        break
+                # Use pieces (generated only) if available, else decoded
+                if pieces:
+                    text = ''.join(pieces)
+                # Strip stop strings from the end
+                for ss in stop_strings:
+                    if ss in text:
+                        text = text[:text.index(ss)]
+                # Strip <|im_end|> (keep <|im_start|> for now)
+                text = text.replace('<|im_end|>', '')
+                # Extract content after think block (skip reasoning)
+                THINK_END = chr(60) + chr(47) + 'think' + chr(62)
+                if THINK_END in text:
+                    text = text.split(THINK_END)[-1]
+                    # Strip leading junk (residual think remnants, newlines)
+                    text = text.lstrip(' \n\r\t')
+                    # Also strip any non-printable leading chars
+                    while text and ord(text[0]) < 32:
+                        text = text[1:]
+                # Now strip <|im_start|> and any remaining special tokens
+                text = text.replace('<|im_start|>', '')
+                text = text.strip()
 
                 gen_lines = [l for l in result.stdout.splitlines()
                              if l.startswith('[') and 'token=' in l]

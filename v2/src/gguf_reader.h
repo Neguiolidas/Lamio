@@ -62,6 +62,9 @@ public:
     // Read a GGUF array-of-int32 metadata value (e.g. tokenizer.ggml.token_type).
     bool get_int32_array(const std::string & key, std::vector<int32_t> & out) const;
 
+    // Read a GGUF scalar int32 metadata value (e.g. tokenizer.ggml.eos_token_id).
+    bool get_int32(const std::string & key, int32_t & out) const;
+
 private:
     bool ok_      = false;
     std::string   error_;

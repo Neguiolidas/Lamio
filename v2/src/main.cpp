@@ -114,6 +114,7 @@ int main(int argc, char ** argv) {
     lamio::SamplerConfig sampler_cfg;
     unsigned int rng_seed = 0;
     std::vector<int> stop_tokens;
+    bool auto_stop = false;
 
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--info") == 0) {
@@ -143,6 +144,8 @@ int main(int argc, char ** argv) {
             if (i + 1 < argc) rng_seed = (unsigned)std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--stop-token") == 0) {
             if (i + 1 < argc) stop_tokens.push_back(std::atoi(argv[++i]));
+        } else if (std::strcmp(argv[i], "--auto-stop") == 0) {
+            auto_stop = true;
         } else if (std::strcmp(argv[i], "--max-layers") == 0) {
             if (i + 1 < argc) ++i; // skip the value
         } else {
@@ -877,8 +880,15 @@ int main(int argc, char ** argv) {
 
             // Check stop tokens
             bool should_stop = false;
+            if (auto_stop && tok.eos_id() >= 0 && best_id == tok.eos_id()) {
+                should_stop = true;
+            }
             for (int st : stop_tokens) {
                 if (best_id == st) { should_stop = true; break; }
+            }
+            // Also stop on <|im_end|> specifically (the EOS token from GGUF metadata)
+            if (auto_stop && tok.eos_id() >= 0 && best_id == tok.eos_id()) {
+                should_stop = true;
             }
             if (should_stop) {
                 std::fprintf(stderr, "stop token %d reached\n", best_id);

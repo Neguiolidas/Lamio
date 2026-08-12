@@ -165,4 +165,14 @@ bool GgufReader::get_int32_array(const std::string & key, std::vector<int32_t> &
     return true;
 }
 
+bool GgufReader::get_int32(const std::string & key, int32_t & out) const {
+    if (!ctx_) return false;
+    const int64_t id = gguf_find_key(ctx_, key.c_str());
+    if (id < 0) return false;
+    const enum gguf_type vt = gguf_get_kv_type(ctx_, id);
+    if (vt != GGUF_TYPE_UINT32 && vt != GGUF_TYPE_INT32) return false;
+    out = (int32_t)gguf_get_val_u32(ctx_, id);
+    return true;
+}
+
 } // namespace lamio

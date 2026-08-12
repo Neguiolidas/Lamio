@@ -28,12 +28,24 @@ public:
     int32_t eos_id() const { return eos_id_; }
     size_t vocab_size() const { return tokens_.size(); }
 
+    // Special token handling: maps special token strings to their IDs
+    // so encode() recognises them as single tokens instead of splitting into BPE
+    void add_special_token(const std::string & text, int32_t id) {
+        special_tokens_[text] = id;
+    }
+    bool is_special_token(int32_t id) const {
+        for (const auto & kv : special_tokens_)
+            if (kv.second == id) return true;
+        return false;
+    }
+
 private:
     std::vector<std::string>         tokens_;    // id -> token
     std::unordered_map<std::string, int32_t> token_map_; // token -> id
     std::unordered_map<std::string, int>  merges_rank_; // "a b" -> priority (0 = highest)
     int32_t bos_id_ = -1;
     int32_t eos_id_ = -1;
+    std::unordered_map<std::string, int32_t> special_tokens_; // special token -> id
 };
 
 } // namespace lamio

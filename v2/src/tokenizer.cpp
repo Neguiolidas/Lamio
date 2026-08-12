@@ -67,8 +67,33 @@ bool BpeTokenizer::load(const GgufReader & r) {
     // For byte-level BPE, tokens are already the actual byte strings/symbols.
 
     bos_id_ = -1;
-    // keep merges_raw available for nothing else; rank_map drives encoding
     merges_rank_ = std::move(rank_map);
+
+    // Auto-detect special tokens: any token containing <| or matching known
+    // special tokens gets registered so encode() treats it as a single ID
+    int32_t eos_id = -1;
+    for (size_t i = 0; i < tokens_.size(); ++i) {
+        const std::string & tok = tokens_[i];
+        if (tok.find("<|") != std::string::npos) {
+            add_special_token(tok, (int32_t)i);
+        }
+        // Also register known Qwen/Ornith special tokens
+        if (tok == "" || tok == "" || tok == "" || tok == "" ||
+            tok == "" || tok == "" || tok == "" || tok == "" ||
+            tok == "" || tok == "" || tok == "" || tok == "" ||
+            tok == "" || tok == "" || tok == "" || tok == "" ||
+            tok == "" || tok == "" || tok == "" || tok == "" ||
+            tok == "" || tok == "" || tok == "" || tok == "") {
+            add_special_token(tok, (int32_t)i);
+        }
+    }
+
+    // Read EOS token ID from metadata
+    int32_t meta_eos = -1;
+    if (r.get_int32("tokenizer.ggml.eos_token_id", meta_eos)) {
+        eos_id_ = meta_eos;
+    }
+
     return true;
 }
 
@@ -77,69 +102,97 @@ std::vector<int32_t> BpeTokenizer::encode(const std::string & text, bool add_bos
     std::vector<int32_t> ids;
     if (add_bos && bos_id_ >= 0) ids.push_back(bos_id_);
 
-    for (const auto & word : split_words(text)) {
-        std::vector<int32_t> w;
-        // Map word to smallest tokens present in vocab (substring split).
-        // Simplified: try the whole word, else each byte.
-        auto try_sub = [&](const std::string & s) -> int32_t {
-            auto it = token_map_.find(s);
-            return it == token_map_.end() ? -1 : it->second;
-        };
-
-        size_t i = 0;
-        while (i < word.size()) {
-            // try longest substring from i present in vocab
-            int best_len = -1; int32_t best_id = -1;
-            for (size_t len = 1; i + len <= word.size(); ++len) {
-                int32_t id = try_sub(word.substr(i, len));
-                if (id >= 0) { best_len = (int)len; best_id = id; }
-            }
-            if (best_len > 0) {
-                w.push_back(best_id);
-                i += best_len;
-            } else {
-                // single byte fallback (raw byte token)
-                char b[2] = { word[i], 0 };
-                int32_t id = try_sub(b);
-                if (id >= 0) w.push_back(id);
-                ++i;
-            }
-        }
-
-        // Apply merges by rank in priority order.
-        // Standard: repeatedly find the lowest-rank adjacent pair and merge.
-        bool changed = true;
-        while (changed && w.size() > 1) {
-            changed = false;
-            int best_rank = INT32_MAX; size_t best_pos = SIZE_MAX;
-            for (size_t j = 0; j + 1 < w.size(); ++j) {
-                if (w[j] < 0 || w[j+1] < 0) continue;
-                std::string pair = tokens_[w[j]] + " " + tokens_[w[j+1]];
-                auto it = merges_rank_.find(pair);
-                if (it != merges_rank_.end() && it->second < best_rank) {
-                    best_rank = it->second;
-                    best_pos = j;
+    // First pass: find all special tokens in the text and split around them.
+    // Special tokens are encoded as single IDs, not BPE-split.
+    size_t i = 0;
+    while (i < text.size()) {
+        // Check if any special token matches at position i
+        bool found_special = false;
+        // Try longest match first: sort by length descending
+        // (simple linear scan since there are <30 special tokens)
+        size_t best_len = 0;
+        int32_t best_id = -1;
+        for (const auto & kv : special_tokens_) {
+            const std::string & st = kv.first;
+            if (i + st.size() <= text.size() && text.compare(i, st.size(), st) == 0) {
+                if (st.size() > best_len) {
+                    best_len = st.size();
+                    best_id = kv.second;
                 }
             }
-            if (best_pos != SIZE_MAX) {
-                // merge: produce the merged token id
-                std::string merged = tokens_[w[best_pos]] + tokens_[w[best_pos+1]];
-                auto it = token_map_.find(merged);
-                if (it == token_map_.end()) {
-                    // Allow "byte-level concatenation" token that may not exist
-                    // as a single vocab entry but is reachable; if not found,
-                    // just leave the pair unmerged to be safe.
-                    best_pos = SIZE_MAX; break;
+        }
+        if (best_id >= 0) {
+            ids.push_back(best_id);
+            i += best_len;
+            found_special = true;
+        }
+        if (found_special) continue;
+
+        // Normal BPE: accumulate until next special token boundary
+        // Find the next special token position
+        size_t end = text.size();
+        for (const auto & kv : special_tokens_) {
+            size_t pos = text.find(kv.first, i + 1);
+            if (pos != std::string::npos && pos < end) end = pos;
+        }
+        std::string segment = text.substr(i, end - i);
+
+        // BPE encode the segment
+        for (const auto & word : split_words(segment)) {
+            std::vector<int32_t> w;
+            auto try_sub = [&](const std::string & s) -> int32_t {
+                auto it = token_map_.find(s);
+                return it == token_map_.end() ? -1 : it->second;
+            };
+
+            size_t j = 0;
+            while (j < word.size()) {
+                int best_slen = -1; int32_t best_sid = -1;
+                for (size_t len = 1; j + len <= word.size(); ++len) {
+                    int32_t id = try_sub(word.substr(j, len));
+                    if (id >= 0) { best_slen = (int)len; best_sid = id; }
                 }
-                w[best_pos] = it->second;
-                w.erase(w.begin() + best_pos + 1);
-                changed = true;
+                if (best_slen > 0) {
+                    w.push_back(best_sid);
+                    j += best_slen;
+                } else {
+                    char b[2] = { word[j], 0 };
+                    int32_t id = try_sub(b);
+                    if (id >= 0) w.push_back(id);
+                    ++j;
+                }
+            }
+
+            bool changed = true;
+            while (changed && w.size() > 1) {
+                changed = false;
+                int best_rank = INT32_MAX; size_t best_pos = SIZE_MAX;
+                for (size_t k = 0; k + 1 < w.size(); ++k) {
+                    if (w[k] < 0 || w[k+1] < 0) continue;
+                    std::string pair = tokens_[w[k]] + " " + tokens_[w[k+1]];
+                    auto it = merges_rank_.find(pair);
+                    if (it != merges_rank_.end() && it->second < best_rank) {
+                        best_rank = it->second;
+                        best_pos = k;
+                    }
+                }
+                if (best_pos != SIZE_MAX) {
+                    std::string merged = tokens_[w[best_pos]] + tokens_[w[best_pos+1]];
+                    auto it = token_map_.find(merged);
+                    if (it == token_map_.end()) {
+                        best_pos = SIZE_MAX; break;
+                    }
+                    w[best_pos] = it->second;
+                    w.erase(w.begin() + best_pos + 1);
+                    changed = true;
+                }
+            }
+
+            for (int32_t id : w) {
+                if (id >= 0) ids.push_back(id);
             }
         }
-
-        for (int32_t id : w) {
-            if (id >= 0) ids.push_back(id);
-        }
+        i = end;
     }
     return ids;
 }
