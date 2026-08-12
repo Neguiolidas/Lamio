@@ -1,5 +1,5 @@
 let serverState = 'connecting';
-let config = { model: '', temperature: 0.7, top_k: 40, top_p: 0.9, repeat_penalty: 1.1, n_predict: 128, seed: -1 };
+let config = { model: '', temperature: 0.7, top_k: 40, top_p: 0.9, repeat_penalty: 1.1, n_predict: 128, seed: -1, n_ctx: 2048 };
 let messageHistory = [];
 let streaming = false;
 let abortCtrl = null;
@@ -146,6 +146,7 @@ async function sendMessage() {
         repeat_penalty: config.repeat_penalty,
         n_predict: config.n_predict,
         seed: config.seed,
+        n_ctx: config.n_ctx,
       }),
       signal: abortCtrl.signal,
     });
@@ -271,6 +272,7 @@ function renderSettings() {
     { key: 'top_p', label: 'Top-P', hint: 'Nucleus sampling threshold (0 = disabled)', min: 0, max: 1, step: 0.01 },
     { key: 'repeat_penalty', label: 'Repeat Penalty', hint: 'Penalize repeated tokens', min: 1, max: 2, step: 0.05 },
     { key: 'n_predict', label: 'Max Tokens', hint: 'Maximum tokens to generate per response', min: 1, max: 4096, step: 1 },
+    { key: 'n_ctx', label: 'Context Window', hint: 'Max context tokens (history + prompt + generation)', min: 256, max: 32768, step: 256 },
     { key: 'seed', label: 'Seed', hint: '-1 = random, 0+ = deterministic', min: -1, max: 999999, step: 1 },
   ];
   for (const s of settings) {
