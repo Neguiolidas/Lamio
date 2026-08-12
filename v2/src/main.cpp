@@ -65,9 +65,9 @@ static void print_info(const char * path) {
     for (const auto & b : mt.blocks) {
         if (b.has_moe) {
             std::printf("blk.%d MoE detail:\n", b.layer);
-            if (b.router.tensor_idx >= 0)
+            if (b.ffn_gate_inp.tensor_idx >= 0)
                 std::printf("  router        : %s [%lld bytes]\n",
-                            b.router.name.c_str(), (long long)b.router.nbytes);
+                            b.ffn_gate_inp.name.c_str(), (long long)b.ffn_gate_inp.nbytes);
             if (b.ffn_gate_exps.tensor_idx >= 0)
                 std::printf("  gate_exps     : %s ne=[%lld %lld %lld] [%lld bytes]\n",
                             b.ffn_gate_exps.name.c_str(),
@@ -195,7 +195,7 @@ int main(int argc, char ** argv) {
         if (!backend) { std::fprintf(stderr, "lamio: backend init failed\n"); return 1; }
 
         // Weight context
-        size_t wpool = ggml_tensor_overhead() * (size_t)(cfg.n_layers * 20 + 128) + 64*1024*1024;
+        size_t wpool = ggml_tensor_overhead() * (size_t)(cfg.n_layers * 30 + 256) + 64*1024*1024;
         void * wbuf = malloc(wpool);
         struct ggml_init_params wparams = { wpool, wbuf, true };
         ggml_context * wctx = ggml_init(wparams);
@@ -235,6 +235,15 @@ int main(int argc, char ** argv) {
             try_load(b.ffn_up);
             try_load(b.ffn_down);
             try_load(b.ffn_norm);
+            // MoE tensors
+            try_load(b.ffn_gate_inp);
+            try_load(b.ffn_gate_exps);
+            try_load(b.ffn_up_exps);
+            try_load(b.ffn_down_exps);
+            try_load(b.ffn_gate_inp_shexp);
+            try_load(b.ffn_gate_shexp);
+            try_load(b.ffn_up_shexp);
+            try_load(b.ffn_down_shexp);
         }
         if (mt.global.output_norm.tensor_idx >= 0) wl.load(mt.global.output_norm);
         if (mt.global.output_weight.tensor_idx >= 0) wl.load(mt.global.output_weight);
@@ -349,6 +358,12 @@ int main(int argc, char ** argv) {
             std::vector<ggml_tensor *> all_zero_init;
             std::vector<lamio::LayerState> layer_states(lim);
 
+            // Create graph early and expand per-layer to avoid stack overflow
+            // on deep models (40+ MoE layers cause deep recursion in build_forward_expand)
+            // Use custom size: 40 layers x ~100 ops/layer + slack
+            size_t graph_size = (size_t)lim * 256 + 2048;
+            ggml_cgraph * gf = ggml_new_graph_custom(cctx, graph_size, false);
+
             for (int l = 0; l < lim; ++l) {
                 bool is_recr = (l + 1) % 4 != 0;
                 lamio::Qwen35Forward fwd{cfg, hp, wl, cctx, is_recr};
@@ -402,6 +417,13 @@ int main(int argc, char ** argv) {
                 }
 
                 x = fwd.build_layer(x, mt.blocks[l], pos_ids, mask, &ls);
+
+                // Expand graph incrementally per-layer to avoid deep recursion
+                ggml_build_forward_expand(gf, x);
+                if (ls.conv_state_out) ggml_build_forward_expand(gf, ls.conv_state_out);
+                if (ls.ssm_state_out)  ggml_build_forward_expand(gf, ls.ssm_state_out);
+                if (ls.kv_k_out)       ggml_build_forward_expand(gf, ls.kv_k_out);
+                if (ls.kv_v_out)       ggml_build_forward_expand(gf, ls.kv_v_out);
                 if (!x) { std::fprintf(stderr, "lamio: forward block %d failed\n", l); break; }
                 for (auto * t : fwd.zero_init) all_zero_init.push_back(t);
             }
@@ -417,18 +439,11 @@ int main(int argc, char ** argv) {
             ggml_tensor * logits = ggml_mul_mat(cctx, output_w, x);
             ggml_set_output(logits);
 
-            // Build graph
-            ggml_cgraph * gf = ggml_new_graph(cctx);
+            // Graph was built incrementally per-layer above.
+            // Just need to expand the final logits and any remaining state tensors.
             ggml_build_forward_expand(gf, logits);
 
-            // Also expand state output tensors into the graph (they are separate from logits)
-            for (int l = 0; l < lim; ++l) {
-                auto & ls = layer_states[l];
-                if (ls.conv_state_out) ggml_build_forward_expand(gf, ls.conv_state_out);
-                if (ls.ssm_state_out)  ggml_build_forward_expand(gf, ls.ssm_state_out);
-                if (ls.kv_k_out)       ggml_build_forward_expand(gf, ls.kv_k_out);
-                if (ls.kv_v_out)       ggml_build_forward_expand(gf, ls.kv_v_out);
-            }
+            // State tensors already expanded per-layer in the loop above
 
             // Reset scheduler and allocate graph
             ggml_backend_sched_reset(sched);
@@ -587,10 +602,10 @@ int main(int argc, char ** argv) {
         lamio::ModelTensors mt = lamio::map_tensors(r, cfg.n_layers);
 
         for (const auto & b : mt.blocks) {
-            if (b.router.tensor_idx >= 0) {
-                const size_t size = (size_t)(b.router.nbytes);
+            if (b.ffn_gate_inp.tensor_idx >= 0) {
+                const size_t size = (size_t)(b.ffn_gate_inp.nbytes);
                 std::vector<uint8_t> buf(size);
-                size_t got = r.load_tensor_data(b.router.tensor_idx, buf.data(), buf.size());
+                size_t got = r.load_tensor_data(b.ffn_gate_inp.tensor_idx, buf.data(), buf.size());
                 std::printf("router load: requested=%zu got=%zu\n", size, got);
                 if (got == size && size > 0) {
                     // compute checksum + first bytes

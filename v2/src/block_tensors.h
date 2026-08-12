@@ -59,7 +59,12 @@ struct BlockTensors {
     TensorRef ffn_gate_exps = {};
     TensorRef ffn_up_exps   = {};
     TensorRef ffn_down_exps = {};
-    TensorRef router        = {};  // "blk.N.ffn_gate_shrink.weight" or similar
+    TensorRef ffn_gate_inp  = {};  // router: [n_embd, n_expert]
+    // shared expert
+    TensorRef ffn_gate_inp_shexp = {};  // [n_embd] -> sigmoid gate
+    TensorRef ffn_gate_shexp = {};      // [n_embd, n_ff_shexp]
+    TensorRef ffn_up_shexp   = {};      // [n_embd, n_ff_shexp]
+    TensorRef ffn_down_shexp = {};      // [n_ff_shexp, n_embd]
 
     bool has_moe = false;
     bool has_dense_ffn = false;

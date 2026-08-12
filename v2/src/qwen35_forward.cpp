@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -93,6 +94,111 @@ static ggml_tensor * build_ffn(ggml_context * ctx, ggml_tensor * cur,
     gate = ggml_silu(ctx, gate);
     ggml_tensor * prod = ggml_mul(ctx, gate, up);
     return ggml_mul_mat(ctx, down_w, prod);
+}
+
+// ---------------------------------------------------------------------------
+// MoE FFN: router -> top-k -> mul_mat_id -> weighted sum + shared expert
+// Follows qwen35moe.cpp build_moe_ffn + shared expert
+// ---------------------------------------------------------------------------
+static ggml_tensor * build_ffn_moe(
+    ggml_context * ctx, ggml_tensor * cur,
+    // routed experts
+    ggml_tensor * gate_inp_w,  // [n_embd, n_expert]
+    ggml_tensor * up_exps_w,   // [n_embd, n_ff_exp, n_expert] or [n_ff_exp, n_embd, n_expert]
+    ggml_tensor * gate_exps_w, // same shape as up_exps
+    ggml_tensor * down_exps_w, // [n_embd, n_ff_exp, n_expert] or inverse
+    int n_expert, int n_expert_used,
+    // shared expert (optional, can be nullptr)
+    ggml_tensor * shexp_gate_w = nullptr,
+    ggml_tensor * shexp_up_w   = nullptr,
+    ggml_tensor * shexp_down_w = nullptr,
+    ggml_tensor * shexp_gate_inp_w = nullptr)
+{
+    const int64_t n_embd   = cur->ne[0];
+    const int64_t n_tokens = cur->ne[1];
+
+    // 1. Router logits: [n_expert, n_tokens]
+    ggml_tensor * logits = ggml_mul_mat(ctx, gate_inp_w, cur);
+
+    // 2. Softmax -> probs [n_expert, n_tokens]
+    ggml_tensor * probs = ggml_soft_max(ctx, logits);
+
+    // 3. Top-k selection: [n_expert_used, n_tokens] (i32 indices)
+    ggml_tensor * selected_experts = ggml_argsort_top_k(ctx, probs, n_expert_used);
+
+    // 4. Reshape probs for gather: [1, n_expert, n_tokens]
+    probs = ggml_reshape_3d(ctx, probs, 1, n_expert, n_tokens);
+
+    // 5. Gather weights: [1, n_expert_used, n_tokens]
+    ggml_tensor * weights = ggml_get_rows(ctx, probs, selected_experts);
+
+    // 5. Normalize weights
+    weights = ggml_reshape_2d(ctx, weights, n_expert_used, n_tokens);
+    ggml_tensor * w_sum = ggml_sum_rows(ctx, weights);
+    w_sum = ggml_clamp(ctx, w_sum, 6.103515625e-5f, INFINITY);
+    weights = ggml_div(ctx, weights, w_sum);
+    weights = ggml_reshape_3d(ctx, weights, 1, n_expert_used, n_tokens);
+
+    // 6. cur -> [n_embd, 1, n_tokens] for mul_mat_id
+    cur = ggml_reshape_3d(ctx, cur, n_embd, 1, n_tokens);
+
+    // 7. Expert FFN: up = mul_mat_id(up_exps, cur, selected_experts) -> [n_ff, k, tokens]
+    ggml_tensor * up = ggml_mul_mat_id(ctx, up_exps_w, cur, selected_experts);
+    ggml_tensor * gate = ggml_mul_mat_id(ctx, gate_exps_w, cur, selected_experts);
+
+    // 8. SiLU: gate = silu(gate), prod = gate * up
+    gate = ggml_silu(ctx, gate);
+    ggml_tensor * prod = ggml_mul(ctx, gate, up);
+
+    // 9. down = mul_mat_id(down_exps, prod, selected_experts) -> [n_embd, k, tokens]
+    ggml_tensor * experts = ggml_mul_mat_id(ctx, down_exps_w, prod, selected_experts);
+
+    // 10. Weight + sum experts
+    experts = ggml_mul(ctx, experts, weights);
+
+    // View each expert and sum as a balanced binary tree to minimize graph depth
+    auto view_expert = [&](int i) -> ggml_tensor * {
+        return ggml_view_2d(ctx, experts, n_embd, n_tokens, experts->nb[2], (size_t)i * experts->nb[1]);
+    };
+    std::vector<ggml_tensor *> nodes;
+    for (int i = 0; i < n_expert_used; ++i)
+        nodes.push_back(view_expert(i));
+    while (nodes.size() > 1) {
+        std::vector<ggml_tensor *> next;
+        for (size_t i = 0; i < nodes.size(); i += 2) {
+            if (i + 1 < nodes.size())
+                next.push_back(ggml_add(ctx, nodes[i], nodes[i+1]));
+            else
+                next.push_back(nodes[i]);
+        }
+        nodes = std::move(next);
+    }
+    ggml_tensor * moe_out = nodes[0];
+    if (n_expert_used == 1)
+        moe_out = ggml_cont(ctx, moe_out);
+
+    // 11. Shared expert (if present)
+    if (shexp_gate_w && shexp_up_w && shexp_down_w) {
+        // undo reshape_3d for shared expert input
+        ggml_tensor * shexp_in = ggml_reshape_2d(ctx, cur, n_embd, n_tokens);
+        ggml_tensor * s_gate = ggml_mul_mat(ctx, shexp_gate_w, shexp_in);
+        ggml_tensor * s_up   = ggml_mul_mat(ctx, shexp_up_w, shexp_in);
+        s_gate = ggml_silu(ctx, s_gate);
+        ggml_tensor * s_prod = ggml_mul(ctx, s_gate, s_up);
+        ggml_tensor * s_down = ggml_mul_mat(ctx, shexp_down_w, s_prod);
+
+        // Shared gate: sigmoid(gate_inp_shexp @ cur) -> [1, n_tokens]
+        if (shexp_gate_inp_w) {
+            ggml_tensor * sgate = ggml_mul_mat(ctx, shexp_gate_inp_w, shexp_in);
+            sgate = ggml_sigmoid(ctx, sgate);
+            sgate = ggml_reshape_2d(ctx, sgate, 1, n_tokens);
+            s_down = ggml_mul(ctx, s_down, sgate);
+        }
+
+        moe_out = ggml_add(ctx, moe_out, s_down);
+    }
+
+    return moe_out;
 }
 
 // ---------------------------------------------------------------------------
@@ -489,8 +595,22 @@ ggml_tensor * Qwen35Forward::build_layer(
         cur = rms_norm_weighted(ctx, cur, weights.load(blk.ffn_norm), hp.norm_eps);
 
     // FFN
-    cur = build_ffn(ctx, cur,
-        weights.load(blk.ffn_gate), weights.load(blk.ffn_up), weights.load(blk.ffn_down));
+    if (blk.has_moe && cfg.n_experts > 0) {
+        // MoE FFN
+        cur = build_ffn_moe(ctx, cur,
+            weights.load(blk.ffn_gate_inp),
+            weights.load(blk.ffn_up_exps),
+            weights.load(blk.ffn_gate_exps),
+            weights.load(blk.ffn_down_exps),
+            cfg.n_experts, cfg.n_active,
+            weights.load(blk.ffn_gate_shexp),
+            weights.load(blk.ffn_up_shexp),
+            weights.load(blk.ffn_down_shexp),
+            weights.load(blk.ffn_gate_inp_shexp));
+    } else {
+        cur = build_ffn(ctx, cur,
+            weights.load(blk.ffn_gate), weights.load(blk.ffn_up), weights.load(blk.ffn_down));
+    }
 
     // FFN residual
     cur = ggml_add(ctx, cur, ffn_residual);

@@ -17,6 +17,8 @@ struct ModelConfig {
     int n_experts      = 0;    // expert_count (0 = dense)
     int n_active       = 0;    // expert_used_count
     int n_ffn_expert   = 0;    // expert_feed_forward_length
+    int n_ff_shexp     = 0;    // expert_shared_feed_forward_length
+    int full_attn_interval = 4; // full_attention_interval (layers 4n-1)
     int vocab_size     = 0;
     int context_length = 0;
     int head_dim       = 0;    // attention.key_length (0 = n_embd/n_heads)

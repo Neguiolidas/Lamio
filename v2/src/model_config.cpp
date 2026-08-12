@@ -33,6 +33,8 @@ ModelConfig parse_model_config(const GgufReader & r) {
     cfg.n_experts      = get_int(md, a + ".expert_count");
     cfg.n_active        = get_int(md, a + ".expert_used_count");
     cfg.n_ffn_expert   = get_int(md, a + ".expert_feed_forward_length");
+    cfg.n_ff_shexp     = get_int(md, a + ".expert_shared_feed_forward_length");
+    cfg.full_attn_interval = get_int(md, a + ".full_attention_interval", 4);
     cfg.context_length = get_int(md, a + ".context_length");
     cfg.head_dim       = get_int(md, a + ".attention.key_length");
     cfg.norm_eps       = get_float(md, a + ".attention.layer_norm_rms_epsilon", 1e-6f);

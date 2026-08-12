@@ -64,10 +64,12 @@ static void scan_block(const GgufReader & r, BlockTensors & blk) {
     find_in_block("ffn_gate_exps.weight", blk.ffn_gate_exps);
     find_in_block("ffn_up_exps.weight", blk.ffn_up_exps);
     find_in_block("ffn_down_exps.weight", blk.ffn_down_exps);
-
-    // Router: try common names
-    bool found_router = find_in_block("ffn_gate_shrink.weight", blk.router);
-    if (!found_router) find_in_block("ffn_gate_inp.weight", blk.router);
+    find_in_block("ffn_gate_inp.weight", blk.ffn_gate_inp);
+    // shared expert
+    find_in_block("ffn_gate_inp_shexp.weight", blk.ffn_gate_inp_shexp);
+    find_in_block("ffn_gate_shexp.weight", blk.ffn_gate_shexp);
+    find_in_block("ffn_up_shexp.weight", blk.ffn_up_shexp);
+    find_in_block("ffn_down_shexp.weight", blk.ffn_down_shexp);
 
     blk.has_moe = blk.ffn_gate_exps.tensor_idx >= 0;
     blk.has_dense_ffn = blk.ffn_gate.tensor_idx >= 0;
@@ -110,7 +112,11 @@ ModelTensors map_tensors(const GgufReader & r, int n_layers) {
         mt.blocks[l].ffn_gate_exps.tensor_idx = -1;
         mt.blocks[l].ffn_up_exps.tensor_idx = -1;
         mt.blocks[l].ffn_down_exps.tensor_idx = -1;
-        mt.blocks[l].router.tensor_idx = -1;
+        mt.blocks[l].ffn_gate_inp.tensor_idx = -1;
+        mt.blocks[l].ffn_gate_inp_shexp.tensor_idx = -1;
+        mt.blocks[l].ffn_gate_shexp.tensor_idx = -1;
+        mt.blocks[l].ffn_up_shexp.tensor_idx = -1;
+        mt.blocks[l].ffn_down_shexp.tensor_idx = -1;
         scan_block(r, mt.blocks[l]);
     }
 
