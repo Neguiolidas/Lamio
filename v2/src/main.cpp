@@ -3,6 +3,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <random>
 
 #include "gguf_reader.h"
 #include "model_config.h"
@@ -11,6 +12,7 @@
 #include "weight_loader.h"
 #include "dense_forward.h"
 #include "qwen35_forward.h"
+#include "sampling.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -101,8 +103,11 @@ int main(int argc, char ** argv) {
     bool tokenize_mode = false;
     bool list_mode = false;
     bool generate_mode = false;
+    bool repl_mode = false;
     const char * model_path = nullptr;
     std::string prompt_text;
+    lamio::SamplerConfig sampler_cfg;
+    unsigned int rng_seed = 0;
 
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--info") == 0) {
@@ -116,9 +121,20 @@ int main(int argc, char ** argv) {
             list_mode = true;
         } else if (std::strcmp(argv[i], "--generate") == 0) {
             generate_mode = true;
+        } else if (std::strcmp(argv[i], "--repl") == 0) {
+            repl_mode = true;
         } else if (std::strcmp(argv[i], "--n-gen") == 0) {
-            // consumed in generate loop below
-            if (i + 1 < argc) ++i; // skip the value
+            if (i + 1 < argc) ++i;
+        } else if (std::strcmp(argv[i], "--temperature") == 0 || std::strcmp(argv[i], "--temp") == 0) {
+            if (i + 1 < argc) sampler_cfg.temperature = std::stof(argv[++i]);
+        } else if (std::strcmp(argv[i], "--top-k") == 0) {
+            if (i + 1 < argc) sampler_cfg.top_k = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--top-p") == 0) {
+            if (i + 1 < argc) sampler_cfg.top_p = std::stof(argv[++i]);
+        } else if (std::strcmp(argv[i], "--repeat-penalty") == 0) {
+            if (i + 1 < argc) sampler_cfg.repeat_penalty = std::stof(argv[++i]);
+        } else if (std::strcmp(argv[i], "--seed") == 0) {
+            if (i + 1 < argc) rng_seed = (unsigned)std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--max-layers") == 0) {
             if (i + 1 < argc) ++i; // skip the value
         } else {
@@ -155,7 +171,8 @@ int main(int argc, char ** argv) {
         if (std::strcmp(argv[i], "--max-layers") == 0 && i + 1 < argc) max_layers = atoi(argv[++i]);
         if (std::strcmp(argv[i], "--n-gen") == 0 && i + 1 < argc) n_gen_tokens = atoi(argv[++i]);
     }
-    if (generate_mode) {
+    if (generate_mode || repl_mode) {
+        std::mt19937 rng(rng_seed > 0 ? rng_seed : std::random_device{}());
         lamio::GgufReader r(model_path);
         if (!r.ok()) { std::fprintf(stderr, "lamio: %s\n", r.error().c_str()); return 1; }
 
@@ -490,15 +507,21 @@ int main(int argc, char ** argv) {
                 (n_tokens - 1) * cfg.vocab_size * sizeof(float),
                 cfg.vocab_size * sizeof(float));
 
-            int32_t best_id = 0;
-            float best_val = -1e30f;
-            for (int i = 0; i < cfg.vocab_size; ++i) {
-                if (logits_buf[i] > best_val) { best_val = logits_buf[i]; best_id = i; }
+            // Sample next token
+            int32_t best_id;
+            float best_val;
+            if (sampler_cfg.temperature == 1.0f && sampler_cfg.top_k == 0 &&
+                sampler_cfg.top_p == 1.0f && sampler_cfg.repeat_penalty == 1.0f) {
+                best_id = 0;
+                best_val = -1e30f;
+                for (int i = 0; i < cfg.vocab_size; ++i) {
+                    if (logits_buf[i] > best_val) { best_val = logits_buf[i]; best_id = i; }
+                }
+            } else {
+                best_val = logits_buf[0];
+                best_id = lamio::sample(logits_buf.data(), cfg.vocab_size,
+                                       sampler_cfg, all_ids, rng);
             }
-
-            if (gen_step == 0)
-                std::fprintf(stderr, "  logits: best=%d(%.4f) tok11=%.4f tok198=%.4f\n",
-                    best_id, best_val, logits_buf[11], logits_buf[198]);
 
             std::printf("[%d] token=%d logit=%.4f\n", gen_step, best_id, best_val);
             all_ids.push_back(best_id);
