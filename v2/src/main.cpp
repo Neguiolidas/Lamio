@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <random>
+#include <iostream>
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -185,10 +186,13 @@ int main(int argc, char ** argv) {
         lamio::BpeTokenizer tok;
         if (!tok.load(r)) { std::fprintf(stderr, "lamio: tokenizer load failed\n"); return 1; }
 
-        std::vector<int32_t> all_ids = tok.encode(gen_prompt);
-        if (all_ids.empty()) { std::fprintf(stderr, "lamio: empty prompt\n"); return 1; }
-        std::printf("prompt: %s\n", gen_prompt.c_str());
-        std::printf("tokens: %zu\n", all_ids.size());
+        std::vector<int32_t> all_ids;
+        if (generate_mode) {
+            all_ids = tok.encode(gen_prompt);
+            if (all_ids.empty()) { std::fprintf(stderr, "lamio: empty prompt\n"); return 1; }
+            std::fprintf(stderr, "prompt: %s\n", gen_prompt.c_str());
+            std::fprintf(stderr, "tokens: %zu\n", all_ids.size());
+        }
 
         // Parse qwen35 hparams
         lamio::Qwen35HParams hp = lamio::parse_qwen35_hparams(cfg, r);
@@ -340,7 +344,7 @@ int main(int argc, char ** argv) {
             ++n_trunk;
         }
         loaded += n_trunk;
-        std::printf("loaded %zu weight tensors (%zu trunk + %zu expert mmap, file=%zuMB)\n",
+        std::fprintf(stderr, "loaded %zu weight tensors (%zu trunk + %zu expert mmap, file=%zuMB)\n",
                     loaded, n_trunk, n_expert, (size_t)file_size / (1024*1024));
 
         // Create the backend scheduler (reused across all gen steps)
@@ -401,9 +405,241 @@ int main(int argc, char ** argv) {
         }
 
         // -------------------------------------------------------------------
-        // Generation loop: step 0 = prefill (all prompt tokens),
-        // steps 1+ = decode (1 token per step)
+        // REPL loop: read prompts from stdin, generate for each one.
+        // Model stays loaded across prompts. KV cache and GDN state persist.
         // -------------------------------------------------------------------
+        if (repl_mode) {
+            std::string line;
+            std::fprintf(stderr, "repl: ready\n");
+            std::fflush(stderr);
+            while (std::getline(std::cin, line)) {
+                if (line.empty()) continue;
+                if (line == "quit" || line == "exit") break;
+
+                // Tokenize the prompt
+                auto ids = tok.encode(line);
+                if (ids.empty()) {
+                    std::printf("[]\n\n");
+                    std::fflush(stdout);
+                    continue;
+                }
+
+                // Append to all_ids for context continuity
+                size_t prev_size = all_ids.size();
+                all_ids.insert(all_ids.end(), ids.begin(), ids.end());
+
+                int gen_step_start = 0;
+                int n_gen = n_gen_tokens > 0 ? n_gen_tokens : 128;
+
+                for (int gen_step = 0; gen_step < n_gen; ++gen_step) {
+                    bool is_prefill = (gen_step == 0);
+                    int n_tokens = is_prefill ? (int)ids.size() : 1;
+
+                    size_t compute_ctx_size = 256 * 1024 * 1024;
+                    void * cbuf = malloc(compute_ctx_size);
+                    struct ggml_init_params cparams = { compute_ctx_size, cbuf, true };
+                    ggml_context * cctx = ggml_init(cparams);
+
+                    size_t ictx_size = ggml_tensor_overhead() * 64 + 128 * 1024 * 1024;
+                    void * ibuf = malloc(ictx_size);
+                    struct ggml_init_params iparams = { ictx_size, ibuf, true };
+                    ggml_context * ictx = ggml_init(iparams);
+
+                    int32_t pos_base = is_prefill ? (int)prev_size : (int)all_ids.size() - 1;
+                    std::vector<int32_t> pos_data(n_tokens);
+                    for (int i = 0; i < n_tokens; ++i) pos_data[i] = pos_base + i;
+
+                    ggml_tensor * idx = ggml_new_tensor_1d(ictx, GGML_TYPE_I32, n_tokens);
+                    ggml_set_input(idx);
+                    ggml_tensor * pos_ids = ggml_new_tensor_1d(ictx, GGML_TYPE_I32, n_tokens);
+                    ggml_set_input(pos_ids);
+                    ggml_tensor * mask = nullptr;
+                    if (is_prefill && n_tokens > 1) {
+                        mask = ggml_new_tensor_2d(ictx, GGML_TYPE_F16, n_tokens, n_tokens);
+                        ggml_set_input(mask);
+                    }
+
+                    std::vector<int32_t> cur_ids(all_ids.end() - n_tokens, all_ids.end());
+                    ggml_tensor * x = ggml_get_rows(cctx, embd_w, idx);
+                    ggml_set_output(x);
+                    ggml_set_input(x);
+
+                    int lim = cfg.n_layers;
+                    std::vector<ggml_tensor *> all_zero_init;
+                    std::vector<lamio::LayerState> layer_states(lim);
+                    size_t graph_size = (size_t)lim * 256 + 2048;
+                    ggml_cgraph * gf = ggml_new_graph_custom(cctx, graph_size, false);
+
+                    for (int l = 0; l < lim; ++l) {
+                        bool is_recr = (l + 1) % 4 != 0;
+                        lamio::Qwen35Forward fwd{cfg, hp, wl, cctx, is_recr};
+                        lamio::LayerState & ls = layer_states[l];
+                        ls.want_state = (p_conv_state[l] != nullptr);
+                        if (is_recr) {
+                            if (!is_prefill && p_conv_state[l]) {
+                                ggml_tensor * cs_in = ggml_new_tensor_3d(ictx, GGML_TYPE_F32,
+                                    conv_kernel - 1, conv_channels, 1);
+                                ggml_set_input(cs_in);
+                                ls.conv_state_in = cs_in;
+                            }
+                            if (!is_prefill && p_ssm_state[l]) {
+                                ggml_tensor * ss_in = ggml_new_tensor_4d(ictx, GGML_TYPE_F32,
+                                    head_v_dim, head_v_dim, num_v_heads, 1);
+                                ggml_set_input(ss_in);
+                                ls.ssm_state_in = ss_in;
+                            }
+                        } else {
+                            if (!is_prefill && p_kv_k[l] && kv_pos > 0) {
+                                ggml_tensor * kk_in = ggml_view_3d(ictx, p_kv_k[l],
+                                    head_dim_attn, n_head_kv, kv_pos,
+                                    p_kv_k[l]->nb[1], p_kv_k[l]->nb[2], 0);
+                                ggml_set_input(kk_in);
+                                ls.kv_k_in = kk_in;
+                                ggml_tensor * vv_in = ggml_view_3d(ictx, p_kv_v[l],
+                                    head_dim_attn, n_head_kv, kv_pos,
+                                    p_kv_v[l]->nb[1], p_kv_v[l]->nb[2], 0);
+                                ggml_set_input(vv_in);
+                                ls.kv_v_in = vv_in;
+                            }
+                            if (p_kv_k[l]) {
+                                int out_pos = is_prefill ? (int)prev_size : kv_pos;
+                                ggml_tensor * kk_out = ggml_view_3d(ictx, p_kv_k[l],
+                                    head_dim_attn, n_head_kv, out_pos + n_tokens,
+                                    p_kv_k[l]->nb[1], p_kv_k[l]->nb[2], 0);
+                                ggml_set_output(kk_out);
+                                ls.kv_k_out = kk_out;
+                                ggml_tensor * vv_out = ggml_view_3d(ictx, p_kv_v[l],
+                                    head_dim_attn, n_head_kv, out_pos + n_tokens,
+                                    p_kv_v[l]->nb[1], p_kv_v[l]->nb[2], 0);
+                                ggml_set_output(vv_out);
+                                ls.kv_v_out = vv_out;
+                            }
+                        }
+                        x = fwd.build_layer(x, mt.blocks[l], pos_ids, mask, &ls);
+                        ggml_build_forward_expand(gf, x);
+                        if (ls.conv_state_out) ggml_build_forward_expand(gf, ls.conv_state_out);
+                        if (ls.ssm_state_out)  ggml_build_forward_expand(gf, ls.ssm_state_out);
+                        if (ls.kv_k_out)       ggml_build_forward_expand(gf, ls.kv_k_out);
+                        if (ls.kv_v_out)       ggml_build_forward_expand(gf, ls.kv_v_out);
+                        if (!x) { std::fprintf(stderr, "lamio: forward block %d failed\n", l); break; }
+                        for (auto * t : fwd.zero_init) all_zero_init.push_back(t);
+                    }
+
+                    ggml_tensor * out_norm_w = wl.load(mt.global.output_norm);
+                    if (out_norm_w) {
+                        x = ggml_rms_norm(cctx, x, cfg.norm_eps);
+                        x = ggml_mul(cctx, x, out_norm_w);
+                    }
+                    ggml_tensor * output_w = wl.load(mt.global.output_weight);
+                    if (!output_w) output_w = embd_w;
+                    ggml_tensor * logits = ggml_mul_mat(cctx, output_w, x);
+                    ggml_set_output(logits);
+                    ggml_build_forward_expand(gf, logits);
+
+                    ggml_backend_sched_reset(sched);
+                    if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+                        std::fprintf(stderr, "lamio: sched alloc failed (step %d)\n", gen_step);
+                        ggml_free(cctx); free(cbuf);
+                        ggml_free(ictx); free(ibuf);
+                        break;
+                    }
+
+                    ggml_backend_tensor_set(idx, cur_ids.data(), 0, n_tokens * sizeof(int32_t));
+                    ggml_backend_tensor_set(pos_ids, pos_data.data(), 0, n_tokens * sizeof(int32_t));
+                    if (mask) {
+                        std::vector<uint16_t> mask_data(n_tokens * n_tokens, 0);
+                        for (int i = 0; i < n_tokens; ++i)
+                            for (int j = 0; j < n_tokens; ++j)
+                                mask_data[i * n_tokens + j] = (j <= i) ? 0x0000 : 0xFC00;
+                        ggml_backend_tensor_set(mask, mask_data.data(), 0,
+                            n_tokens * n_tokens * sizeof(uint16_t));
+                    }
+
+                    if (!is_prefill) {
+                        for (int l = 0; l < lim; ++l) {
+                            bool is_recr = (l + 1) % 4 != 0;
+                            auto & ls = layer_states[l];
+                            if (is_recr) {
+                                if (ls.conv_state_in && p_conv_state[l])
+                                    ggml_backend_tensor_copy(p_conv_state[l], ls.conv_state_in);
+                                if (ls.ssm_state_in && p_ssm_state[l])
+                                    ggml_backend_tensor_copy(p_ssm_state[l], ls.ssm_state_in);
+                            }
+                        }
+                    }
+
+                    for (auto * t : all_zero_init) {
+                        if (t && t->buffer) ggml_backend_tensor_memset(t, 0, 0, ggml_nbytes(t));
+                    }
+
+                    ggml_status status = ggml_backend_sched_graph_compute(sched, gf);
+                    if (status != GGML_STATUS_SUCCESS) {
+                        std::fprintf(stderr, "lamio: compute failed (step %d)\n", gen_step);
+                        ggml_free(cctx); free(cbuf);
+                        ggml_free(ictx); free(ibuf);
+                        break;
+                    }
+
+                    {
+                        for (int l = 0; l < lim; ++l) {
+                            bool is_recr = (l + 1) % 4 != 0;
+                            auto & ls = layer_states[l];
+                            if (is_recr) {
+                                if (ls.conv_state_out && p_conv_state[l])
+                                    ggml_backend_tensor_copy(ls.conv_state_out, p_conv_state[l]);
+                                if (ls.ssm_state_out && p_ssm_state[l])
+                                    ggml_backend_tensor_copy(ls.ssm_state_out, p_ssm_state[l]);
+                            }
+                        }
+                        if (is_prefill) {
+                            kv_pos = (int)prev_size + n_tokens;
+                        } else {
+                            kv_pos++;
+                        }
+                    }
+
+                    std::vector<float> logits_buf(cfg.vocab_size);
+                    ggml_backend_tensor_get(logits, logits_buf.data(),
+                        (n_tokens - 1) * cfg.vocab_size * sizeof(float),
+                        cfg.vocab_size * sizeof(float));
+
+                    int32_t best_id;
+                    float best_val;
+                    if (sampler_cfg.temperature == 1.0f && sampler_cfg.top_k == 0 &&
+                        sampler_cfg.top_p == 1.0f && sampler_cfg.repeat_penalty == 1.0f) {
+                        best_id = 0; best_val = -1e30f;
+                        for (int i = 0; i < cfg.vocab_size; ++i) {
+                            if (logits_buf[i] > best_val) { best_val = logits_buf[i]; best_id = i; }
+                        }
+                    } else {
+                        best_val = logits_buf[0];
+                        best_id = lamio::sample(logits_buf.data(), cfg.vocab_size,
+                                               sampler_cfg, all_ids, rng);
+                    }
+
+                    std::string piece = tok.decode({best_id});
+                    std::printf("%s", piece.c_str());
+                    std::fflush(stdout);
+                    all_ids.push_back(best_id);
+
+                    ggml_free(ictx); free(ibuf);
+                    ggml_free(cctx); free(cbuf);
+                }
+
+                std::printf("\n\n");
+                std::fflush(stdout);
+                std::fprintf(stderr, "repl: ready\n");
+                std::fflush(stderr);
+            }
+
+            ggml_backend_sched_free(sched);
+            ggml_backend_buffer_free(wbackend_buf);
+            ggml_free(wctx); free(wbuf);
+            ggml_backend_free(backend);
+            return 0;
+        }
+
+        // --- One-shot generate mode (original) ---
         for (int gen_step = 0; gen_step < n_gen_tokens; ++gen_step) {
             bool is_prefill = (gen_step == 0);
             int n_tokens = is_prefill ? (int)all_ids.size() : 1;

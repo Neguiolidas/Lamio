@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Lamio v2 HTTP server. Serves the web UI and proxies generation to the lamio binary."""
+"""Lamio v2 HTTP server. Serves the web UI and manages a persistent lamio --repl process."""
 
 import http.server
 import json
@@ -10,27 +10,38 @@ import time
 import glob
 import struct
 import logging
-import traceback
+import threading
+import select
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger('lamio')
 
 HOST = '0.0.0.0'
 PORT = 5180
-WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'web')
-MODELS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'models')
-LAMIO_BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'build', 'src', 'lamio')
-LD_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'build', 'bin')
+FILE_DIR = os.path.dirname(os.path.abspath(__file__))
+WEB_DIR = os.path.join(FILE_DIR, 'web')
+MODELS_DIR = os.path.join(os.path.dirname(os.path.dirname(FILE_DIR)), 'models')
+# Fix: FILE_DIR = .../v2, models = .../Lamio/models (one level up from v2)
+if not os.path.isdir(MODELS_DIR):
+    MODELS_DIR = os.path.join(os.path.dirname(FILE_DIR), 'models')
+LAMIO_BIN = os.path.join(FILE_DIR, 'build', 'src', 'lamio')
+LD_PATH = os.path.join(os.path.dirname(os.path.dirname(FILE_DIR)), 'build', 'bin')
+# Fix: same pattern as MODELS_DIR
+if not os.path.isdir(LD_PATH):
+    LD_PATH = os.path.join(os.path.dirname(FILE_DIR), 'build', 'bin')
 
-current_model = None  # full path
+repl_proc = None
+repl_model = None
+repl_lock = threading.Lock()
+current_model = None
 current_model_name = None
 telemetry = {'total_tokens': 0, 'last_tps': 0, 'last_elapsed': 0}
+_hdr_cache = {}
 
 
 def get_rss():
-    """Get RSS of this server process in MB."""
     try:
-        with open(f'/proc/self/status') as f:
+        with open('/proc/self/status') as f:
             for line in f:
                 if line.startswith('VmRSS:'):
                     return int(line.split()[1]) // 1024
@@ -39,34 +50,153 @@ def get_rss():
     return 0
 
 
-_hdr_cache = {}
+def get_repl_rss():
+    if repl_proc and repl_proc.poll() is None:
+        try:
+            with open(f'/proc/{repl_proc.pid}/status') as f:
+                for line in f:
+                    if line.startswith('VmRSS:'):
+                        return int(line.split()[1]) // 1024
+        except:
+            pass
+    return 0
+
+
+def start_repl(model_path, temp=0.7, top_k=40, top_p=0.9, repeat_penalty=1.1, seed=-1, n_gen=128):
+    """Start a persistent lamio --repl process."""
+    global repl_proc, repl_model
+    stop_repl()
+    args = [LAMIO_BIN, model_path, '--repl', '--n-gen', str(n_gen),
+            '--temp', str(temp), '--top-k', str(top_k), '--top-p', str(top_p),
+            '--repeat-penalty', str(repeat_penalty)]
+    if seed and seed > 0:
+        args.extend(['--seed', str(seed)])
+    env = os.environ.copy()
+    env['LD_LIBRARY_PATH'] = LD_PATH
+    log.info(f'starting repl: {model_path}')
+    repl_proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, env=env, bufsize=0)
+    repl_model = model_path
+    # Wait for "repl: ready" on stderr
+    wait_for_ready()
+
+
+def stop_repl():
+    global repl_proc, repl_model
+    if repl_proc:
+        try:
+            repl_proc.stdin.close()
+            repl_proc.wait(timeout=5)
+        except:
+            repl_proc.kill()
+        repl_proc = None
+    repl_model = None
+
+
+def wait_for_ready(timeout=120):
+    """Wait for 'repl: ready' on stderr."""
+    if not repl_proc:
+        return False
+    start = time.time()
+    while time.time() - start < timeout:
+        ready, _, _ = select.select([repl_proc.stderr], [], [], 0.5)
+        if ready:
+            line = repl_proc.stderr.readline().decode('utf-8', errors='replace').strip()
+            log.info(f'repl stderr: {line}')
+            if 'repl: ready' in line:
+                return True
+            if 'failed' in line.lower() or 'error' in line.lower():
+                return False
+    log.warning('repl: ready timeout')
+    return False
+
+
+def send_prompt(prompt):
+    """Send a prompt to the persistent REPL and read the response."""
+    global telemetry
+    if not repl_proc or repl_proc.poll() is not None:
+        return {'error': 'model not loaded'}, 500
+    with repl_lock:
+        import fcntl
+        # Make stdout non-blocking
+        stdout_fd = repl_proc.stdout.fileno()
+        stderr_fd = repl_proc.stderr.fileno()
+        fl = fcntl.fcntl(stdout_fd, fcntl.F_GETFL)
+        fcntl.fcntl(stdout_fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+
+        t0 = time.time()
+        try:
+            repl_proc.stdin.write((prompt + '\n').encode())
+            repl_proc.stdin.flush()
+        except BrokenPipeError:
+            return {'error': 'model process died'}, 500
+
+        output = b''
+        while True:
+            # Check stderr for ready signal
+            ready_err, _, _ = select.select([stderr_fd], [], [], 0.1)
+            if ready_err:
+                try:
+                    line = os.read(stderr_fd, 4096).decode('utf-8', errors='replace').strip()
+                    if line:
+                        log.info(f'repl stderr: {line}')
+                    if 'repl: ready' in line:
+                        break
+                    if 'failed' in line.lower() or 'error' in line.lower() or 'assert' in line.lower():
+                        log.error(f'repl error: {line}')
+                        return {'error': f'model error: {line}'}, 500
+                except BlockingIOError:
+                    pass
+
+            # Read stdout
+            try:
+                chunk = os.read(stdout_fd, 4096)
+                if chunk:
+                    output += chunk
+            except BlockingIOError:
+                pass
+
+            if time.time() - t0 > 600:
+                log.error('repl: generation timed out')
+                return {'error': 'generation timed out'}, 504
+
+        # Restore blocking mode
+        fcntl.fcntl(stdout_fd, fcntl.F_SETFL, fl)
+
+        elapsed = time.time() - t0
+        text = output.decode('utf-8', errors='replace').strip()
+        n_tok = len([w for w in text.split() if w]) if text else 0
+        tps = n_tok / elapsed if elapsed > 0 else 0
+        telemetry['total_tokens'] += n_tok
+        telemetry['last_tps'] = round(tps, 2)
+        telemetry['last_elapsed'] = round(elapsed, 2)
+        log.info(f'generate done: {n_tok} tokens in {elapsed:.1f}s ({tps:.1f} t/s)')
+        return {'text': text, 'tokens': n_tok, 'tps': round(tps, 2), 'elapsed': round(elapsed, 2)}, 200
+
 
 def parse_gguf_header(path):
-    """Read GGUF metadata for arch, params, layers, context. Cached."""
     if path in _hdr_cache:
         return _hdr_cache[path]
-    info = {'arch': 'unknown', 'params': '', 'n_layers': 0, 'n_ctx': 0, 'n_experts': 0}
+    info = {'arch': 'unknown', 'n_layers': 0, 'n_ctx': 0, 'n_experts': 0}
     try:
         with open(path, 'rb') as f:
             magic = f.read(4)
             if magic != b'GGUF':
                 _hdr_cache[path] = info
                 return info
-            f.read(4)  # version
+            f.read(4)
             n_kv = struct.unpack('<Q', f.read(8))[0]
-            f.read(8)  # n_tensors
+            f.read(8)
             kvs = {}
             for idx in range(n_kv):
                 klen = struct.unpack('<Q', f.read(8))[0]
                 if klen > 10000:
-                    log.warning(f'gguf parse desync at KV idx {idx}, klen={klen} -- stopping early')
                     break
                 key = f.read(klen).decode('utf-8', errors='replace')
                 vtype = struct.unpack('<I', f.read(4))[0]
                 try:
                     val = _read_kv_value(f, vtype)
                 except (struct.error, OverflowError, ValueError):
-                    log.warning(f'gguf parse error at KV idx {idx} ({key}) -- stopping early')
                     break
                 if val is not None:
                     kvs[key] = val
@@ -82,46 +212,30 @@ def parse_gguf_header(path):
 
 
 def _read_kv_value(f, vtype):
-    """Read a GGUF KV value based on type enum."""
-    if vtype == 0:
-        return struct.unpack('<B', f.read(1))[0]   # uint8
-    elif vtype == 1:
-        return struct.unpack('<b', f.read(1))[0]   # int8
-    elif vtype == 2:
-        return struct.unpack('<H', f.read(2))[0]    # uint16
-    elif vtype == 3:
-        return struct.unpack('<h', f.read(2))[0]    # int16
-    elif vtype == 4:
-        return struct.unpack('<I', f.read(4))[0]    # uint32
-    elif vtype == 5:
-        return struct.unpack('<i', f.read(4))[0]    # int32
-    elif vtype == 6:
-        return struct.unpack('<f', f.read(4))[0]    # float32
-    elif vtype == 7:
-        return struct.unpack('<?', f.read(1))[0]    # bool
+    if vtype == 0: return struct.unpack('<B', f.read(1))[0]
+    elif vtype == 1: return struct.unpack('<b', f.read(1))[0]
+    elif vtype == 2: return struct.unpack('<H', f.read(2))[0]
+    elif vtype == 3: return struct.unpack('<h', f.read(2))[0]
+    elif vtype == 4: return struct.unpack('<I', f.read(4))[0]
+    elif vtype == 5: return struct.unpack('<i', f.read(4))[0]
+    elif vtype == 6: return struct.unpack('<f', f.read(4))[0]
+    elif vtype == 7: return struct.unpack('<?', f.read(1))[0]
     elif vtype == 8:
         slen = struct.unpack('<Q', f.read(8))[0]
         return f.read(slen).decode('utf-8', errors='replace')
     elif vtype == 9:
-        # Array: elem_type (uint32) + count (uint64) + elements
         elem_type = struct.unpack('<I', f.read(4))[0]
         count = struct.unpack('<Q', f.read(8))[0]
         for _ in range(count):
             _read_kv_value(f, elem_type)
         return None
-    elif vtype == 10:
-        return struct.unpack('<Q', f.read(8))[0]  # uint64
-    elif vtype == 11:
-        return struct.unpack('<q', f.read(8))[0]  # int64
-    elif vtype == 12:
-        return struct.unpack('<d', f.read(8))[0]  # float64
-    else:
-        return None
+    elif vtype == 10: return struct.unpack('<Q', f.read(8))[0]
+    elif vtype == 11: return struct.unpack('<q', f.read(8))[0]
+    elif vtype == 12: return struct.unpack('<d', f.read(8))[0]
+    else: return None
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
-    # No protocol_version override - use default HTTP/1.0 to avoid keepalive issues
-
     def _send_json(self, data, code=200):
         body = json.dumps(data).encode()
         self.send_response(code)
@@ -150,12 +264,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == '/api/health':
+            model_name = current_model_name
+            hdr = parse_gguf_header(current_model) if current_model else {}
             self._send_json({
                 'status': 'online' if current_model else 'ready',
                 'model_loaded': current_model is not None,
-                'model': current_model_name,
-                'arch': parse_gguf_header(current_model)['arch'] if current_model else None,
-                'n_ctx': parse_gguf_header(current_model)['n_ctx'] if current_model else 0,
+                'model': model_name,
+                'arch': hdr.get('arch'),
+                'n_ctx': hdr.get('n_ctx', 0),
             })
         elif self.path == '/api/models':
             models = []
@@ -166,17 +282,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 size = os.path.getsize(p)
                 hdr = parse_gguf_header(p)
                 models.append({
-                    'name': name,
-                    'size': size,
-                    'arch': hdr['arch'],
-                    'n_layers': hdr['n_layers'],
-                    'n_ctx': hdr['n_ctx'],
-                    'n_experts': hdr['n_experts'],
+                    'name': name, 'size': size,
+                    'arch': hdr['arch'], 'n_layers': hdr['n_layers'],
+                    'n_ctx': hdr['n_ctx'], 'n_experts': hdr['n_experts'],
                     'loaded': (p == current_model),
                 })
             self._send_json(models)
         elif self.path == '/api/telemetry':
-            self._send_json({**telemetry, 'model': current_model_name, 'rss_mb': get_rss()})
+            self._send_json({**telemetry, 'model': current_model_name, 'rss_mb': get_repl_rss()})
         elif self.path == '/api/memory':
             self._send_json({'layers': []})
         elif self.path == '/' or self.path == '/index.html':
@@ -212,6 +325,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif self.path == '/api/models/unload':
             current_model = None
             current_model_name = None
+            stop_repl()
             log.info('unloaded model')
             self._send_json({'ok': True})
 
@@ -240,7 +354,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 truncated_hist.insert(0, msg)
                 char_count += len(msg)
 
-            full_prompt = ' '.join(truncated_hist) + ' ' + prompt if truncated_hist else prompt
+            # Build chat-formatted prompt
+            if truncated_hist:
+                full_prompt = ''
+                for i, msg in enumerate(truncated_hist):
+                    role = 'User' if i % 2 == 0 else 'Assistant'
+                    full_prompt += f'{role}: {msg}\n'
+                full_prompt += f'User: {prompt}\nAssistant: '
+            else:
+                full_prompt = prompt
 
             args = [LAMIO_BIN, current_model, '--generate', '--prompt', full_prompt,
                     '--n-gen', str(n_predict), '--temp', str(temp),
@@ -272,7 +394,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         text = line[9:]
                         break
 
-                # Count actual generated tokens from output lines like "[0] token=..."
                 gen_lines = [l for l in result.stdout.splitlines() if l.startswith('[') and 'token=' in l]
                 n_tok = len(gen_lines)
                 tps = n_tok / elapsed if elapsed > 0 else 0
@@ -287,34 +408,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 log.error(f'generate timed out after 600s')
                 self._send_json({'error': 'generation timed out (600s limit)'}, 504)
             except Exception as e:
-                log.error(f'generate exception: {traceback.format_exc()}')
+                log.error(f'generate exception: {e}')
                 self._send_json({'error': str(e)}, 500)
         else:
             self._send_json({'error': 'not found'}, 404)
 
     def log_message(self, format, *args):
-        # Suppress default request logging; we log manually in handlers
         pass
 
 
 def main():
-    srv = http.server.HTTPServer((HOST, PORT), Handler)
     log.info(f'Lamio server on http://{HOST}:{PORT}')
-    log.info(f'Models dir: {MODELS_DIR}')
+    log.info(f'Models: {MODELS_DIR}')
     log.info(f'Binary: {LAMIO_BIN}')
-    log.info(f'LD_LIBRARY_PATH: {LD_PATH}')
-
-    # Verify binary exists
     if not os.path.isfile(LAMIO_BIN):
         log.error(f'Binary not found: {LAMIO_BIN}')
-        log.error('Build first: cd v2 && cmake --build build -j 2')
         sys.exit(1)
-
+    srv = http.server.ThreadingHTTPServer((HOST, PORT), Handler)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
+        stop_repl()
         log.info('shutting down')
-        srv.shutdown()
 
 
 if __name__ == '__main__':
