@@ -195,7 +195,7 @@ int main(int argc, char ** argv) {
         if (!backend) { std::fprintf(stderr, "lamio: backend init failed\n"); return 1; }
 
         // Weight context
-        size_t wpool = ggml_tensor_overhead() * 2048 + 32*1024*1024;
+        size_t wpool = ggml_tensor_overhead() * (size_t)(cfg.n_layers * 20 + 128) + 64*1024*1024;
         void * wbuf = malloc(wpool);
         struct ggml_init_params wparams = { wpool, wbuf, true };
         ggml_context * wctx = ggml_init(wparams);
@@ -205,36 +205,36 @@ int main(int argc, char ** argv) {
         ggml_tensor * embd_w = wl.load(mt.global.token_embd);
         for (int l = 0; l < cfg.n_layers; ++l) {
             const auto & b = mt.blocks[l];
-            bool is_recr = (l + 1) % 4 != 0;  // qwen35 default
+            bool is_recr = (l + 1) % 4 != 0;  // qwen35 hybrid: layer 3,7,11,15,17 = attention
+            auto try_load = [&](const lamio::TensorRef & ref) {
+                if (ref.tensor_idx >= 0) wl.load(ref);
+            };
             if (is_recr) {
-                // delta net layer
-                if (b.attn_norm.tensor_idx >= 0) wl.load(b.attn_norm);
-                if (b.attn_post_norm.tensor_idx >= 0) wl.load(b.attn_post_norm);
-                if (b.attn_qkv.tensor_idx >= 0) wl.load(b.attn_qkv);
-                if (b.attn_gate.tensor_idx >= 0) wl.load(b.attn_gate);
-                if (b.ssm_conv1d.tensor_idx >= 0) wl.load(b.ssm_conv1d);
-                if (b.ssm_dt.tensor_idx >= 0) wl.load(b.ssm_dt);
-                if (b.ssm_a.tensor_idx >= 0) wl.load(b.ssm_a);
-                if (b.ssm_alpha.tensor_idx >= 0) wl.load(b.ssm_alpha);
-                if (b.ssm_beta.tensor_idx >= 0) wl.load(b.ssm_beta);
-                if (b.ssm_norm.tensor_idx >= 0) wl.load(b.ssm_norm);
-                if (b.ssm_out.tensor_idx >= 0) wl.load(b.ssm_out);
+                try_load(b.attn_norm);
+                try_load(b.attn_post_norm);
+                try_load(b.attn_qkv);
+                try_load(b.attn_gate);
+                try_load(b.ssm_conv1d);
+                try_load(b.ssm_dt);
+                try_load(b.ssm_a);
+                try_load(b.ssm_alpha);
+                try_load(b.ssm_beta);
+                try_load(b.ssm_norm);
+                try_load(b.ssm_out);
             } else {
-                // standard attention layer
-                if (b.attn_norm.tensor_idx >= 0) wl.load(b.attn_norm);
-                if (b.attn_post_norm.tensor_idx >= 0) wl.load(b.attn_post_norm);
-                if (b.attn_q.tensor_idx >= 0) wl.load(b.attn_q);
-                if (b.attn_k.tensor_idx >= 0) wl.load(b.attn_k);
-                if (b.attn_v.tensor_idx >= 0) wl.load(b.attn_v);
-                if (b.attn_output.tensor_idx >= 0) wl.load(b.attn_output);
-                if (b.attn_q_norm.tensor_idx >= 0) wl.load(b.attn_q_norm);
-                if (b.attn_k_norm.tensor_idx >= 0) wl.load(b.attn_k_norm);
+                try_load(b.attn_norm);
+                try_load(b.attn_post_norm);
+                try_load(b.attn_q);
+                try_load(b.attn_k);
+                try_load(b.attn_v);
+                try_load(b.attn_output);
+                try_load(b.attn_q_norm);
+                try_load(b.attn_k_norm);
             }
-            // FFN (all layers)
-            if (b.ffn_gate.tensor_idx >= 0) wl.load(b.ffn_gate);
-            if (b.ffn_up.tensor_idx >= 0) wl.load(b.ffn_up);
-            if (b.ffn_down.tensor_idx >= 0) wl.load(b.ffn_down);
-            if (b.ffn_norm.tensor_idx >= 0) wl.load(b.ffn_norm);
+            try_load(b.ffn_gate);
+            try_load(b.ffn_up);
+            try_load(b.ffn_down);
+            try_load(b.ffn_norm);
         }
         if (mt.global.output_norm.tensor_idx >= 0) wl.load(mt.global.output_norm);
         if (mt.global.output_weight.tensor_idx >= 0) wl.load(mt.global.output_weight);
