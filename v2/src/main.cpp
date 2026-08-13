@@ -24,6 +24,7 @@
 
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "ggml-cuda.h"
 #include "ggml-cpu.h"
 
 static void print_info(const char * path) {
@@ -215,7 +216,17 @@ int main(int argc, char ** argv) {
         lamio::Qwen35HParams hp = lamio::parse_qwen35_hparams(cfg, r);
 
         // ggml setup
-        ggml_backend_t backend = ggml_backend_cpu_init();
+        ggml_backend_t backend = nullptr;
+        ggml_backend_t gpu_backend = nullptr;
+        // Prefer GPU if available; fall back to CPU.
+#ifdef LAMIO_GPU_CUDA
+        gpu_backend = ggml_backend_cuda_init(0);
+        if (gpu_backend) {
+            fprintf(stderr, "lamio: using CUDA GPU backend\n");
+            backend = gpu_backend;
+        } else
+#endif
+        { backend = ggml_backend_cpu_init(); }
         if (!backend) { std::fprintf(stderr, "lamio: backend init failed\n"); return 1; }
         // Use the configured CPU thread count. Default 1 preserves the original
         // single-thread behavior (optimal for small models where thread sync
@@ -412,10 +423,22 @@ int main(int argc, char ** argv) {
                     loaded, n_trunk, n_expert, (size_t)file_size / (1024*1024));
 
         // Create the backend scheduler (reused across all gen steps)
-        ggml_backend_t sched_backends[1] = { backend };
-        ggml_backend_buffer_type_t sched_bufts[1] = { ggml_backend_cpu_buffer_type() };
-        ggml_backend_sched_t sched = ggml_backend_sched_new(
-            sched_backends, sched_bufts, 1, 16384, false, false);
+        ggml_backend_sched_t sched = nullptr;
+#ifdef LAMIO_GPU_CUDA
+        if (gpu_backend) {
+            ggml_backend_t backends[2] = { gpu_backend, backend };
+            ggml_backend_buffer_type_t bufts[2] = {
+                ggml_backend_cuda_buffer_type(0),
+                ggml_backend_cpu_buffer_type()
+            };
+            sched = ggml_backend_sched_new(backends, bufts, 2, 16384, false, false);
+        } else
+#endif
+        {
+            ggml_backend_t sched_backends[1] = { backend };
+            ggml_backend_buffer_type_t sched_bufts[1] = { ggml_backend_cpu_buffer_type() };
+            sched = ggml_backend_sched_new(sched_backends, sched_bufts, 1, 16384, false, false);
+        }
         if (!sched) {
             std::fprintf(stderr, "lamio: failed to create backend scheduler\n");
             return 1;
