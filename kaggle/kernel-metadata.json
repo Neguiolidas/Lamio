@@ -1,0 +1,13 @@
+{
+  "code_file": "lamio-moe-inference.ipynb",
+  "competition_sources": [],
+  "dataset_sources": [],
+  "enable_gpu": true,
+  "enable_internet": true,
+  "id": "neguiolidas/lamio-moe-inference",
+  "is_private": true,
+  "kernel_sources": [],
+  "kernel_type": "notebook",
+  "language": "python",
+  "title": "Lamio MoE Inference (Ornith-35B)"
+}
