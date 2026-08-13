@@ -288,6 +288,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 '--top-k', str(top_k), '--top-p', str(top_p),
                 '--repeat-penalty', str(repeat_penalty),
                 '--auto-stop']
+        # MoE memory orchestration: cap expert cache RSS
+        max_rss = os.environ.get('LAMIO_MAX_RSS_MB', '0')
+        if max_rss and int(max_rss) > 0:
+            args.extend(['--max-rss-mb', max_rss])
+        # CPU threads (default 1; small models don't benefit from threading overhead)
+        threads = os.environ.get('LAMIO_THREADS', '1')
+        if threads and int(threads) > 0:
+            args.extend(['--threads', threads])
         if seed and seed > 0:
             args.extend(['--seed', str(seed)])
 

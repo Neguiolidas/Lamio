@@ -112,7 +112,8 @@ static ggml_tensor * build_ffn_moe(
     ggml_tensor * shexp_gate_w = nullptr,
     ggml_tensor * shexp_up_w   = nullptr,
     ggml_tensor * shexp_down_w = nullptr,
-    ggml_tensor * shexp_gate_inp_w = nullptr)
+    ggml_tensor * shexp_gate_inp_w = nullptr,
+    ggml_tensor ** selected_experts_out = nullptr)   // optional: captures top-k indices
 {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
@@ -125,6 +126,14 @@ static ggml_tensor * build_ffn_moe(
 
     // 3. Top-k selection: [n_expert_used, n_tokens] (i32 indices)
     ggml_tensor * selected_experts = ggml_argsort_top_k(ctx, probs, n_expert_used);
+
+    // Optional: expose top-k indices to the host (for MoE-aware RSS orchestration).
+    // Materialize as output tensor so the caller can read indices post-compute.
+    if (selected_experts_out) {
+        ggml_tensor * sel_cont = ggml_cont(ctx, selected_experts);
+        ggml_set_output(sel_cont);
+        *selected_experts_out = sel_cont;
+    }
 
     // 4. Reshape probs for gather: [1, n_expert, n_tokens]
     probs = ggml_reshape_3d(ctx, probs, 1, n_expert, n_tokens);
@@ -595,8 +604,10 @@ ggml_tensor * Qwen35Forward::build_layer(
         cur = rms_norm_weighted(ctx, cur, weights.load(blk.ffn_norm), hp.norm_eps);
 
     // FFN
+    selected_experts = nullptr;
     if (blk.has_moe && cfg.n_experts > 0) {
         // MoE FFN
+        ggml_tensor * sel = nullptr;
         cur = build_ffn_moe(ctx, cur,
             weights.load(blk.ffn_gate_inp),
             weights.load(blk.ffn_up_exps),
@@ -606,7 +617,9 @@ ggml_tensor * Qwen35Forward::build_layer(
             weights.load(blk.ffn_gate_shexp),
             weights.load(blk.ffn_up_shexp),
             weights.load(blk.ffn_down_shexp),
-            weights.load(blk.ffn_gate_inp_shexp));
+            weights.load(blk.ffn_gate_inp_shexp),
+            want_selected ? &sel : nullptr);
+        if (want_selected) selected_experts = sel;
     } else {
         cur = build_ffn(ctx, cur,
             weights.load(blk.ffn_gate), weights.load(blk.ffn_up), weights.load(blk.ffn_down));

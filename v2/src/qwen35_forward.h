@@ -85,6 +85,12 @@ struct Qwen35Forward {
     ggml_tensor * gdn_output    = nullptr;
     ggml_tensor * final_output  = nullptr;
 
+    // MoE: captures the top-k selected expert indices tensor after build_layer.
+    // Used by the host orchestrator to drive expert eviction/prefetch. Null if
+    // this layer is not MoE or the capture wasn't requested.
+    ggml_tensor * selected_experts = nullptr;
+    bool want_selected = false;
+
     // New state written by the forward pass (extracted from graph)
     ggml_tensor * new_conv_state = nullptr;
     ggml_tensor * new_ssm_state  = nullptr;

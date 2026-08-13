@@ -5,6 +5,8 @@
 #include <vector>
 #include <random>
 #include <iostream>
+#include <thread>
+#include <climits>
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -16,6 +18,7 @@
 #include "weight_loader.h"
 #include "dense_forward.h"
 #include "qwen35_forward.h"
+#include "expert_router.h"
 #include "sampling.h"
 // server.h not needed - serve mode uses httplib inline
 
@@ -144,6 +147,10 @@ int main(int argc, char ** argv) {
             if (i + 1 < argc) rng_seed = (unsigned)std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--stop-token") == 0) {
             if (i + 1 < argc) stop_tokens.push_back(std::atoi(argv[++i]));
+        } else if (std::strcmp(argv[i], "--threads") == 0) {
+            if (i + 1 < argc) ++i; // skip the value (parsed in second loop)
+        } else if (std::strcmp(argv[i], "--max-rss-mb") == 0) {
+            if (i + 1 < argc) ++i; // skip the value (parsed in second loop)
         } else if (std::strcmp(argv[i], "--auto-stop") == 0) {
             auto_stop = true;
         } else if (std::strcmp(argv[i], "--max-layers") == 0) {
@@ -178,9 +185,13 @@ int main(int argc, char ** argv) {
     if (gen_prompt.empty()) gen_prompt = "Hello";
     int n_gen_tokens = 8;
     int max_layers = -1;  // -1 = all
+    int n_cpu_threads = 1; // CPU threads for the matmul backend
+    int max_rss_mb = 0;    // MoE expert cache budget (0 = unlimited); see ExpertRouter
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--max-layers") == 0 && i + 1 < argc) max_layers = atoi(argv[++i]);
         if (std::strcmp(argv[i], "--n-gen") == 0 && i + 1 < argc) n_gen_tokens = atoi(argv[++i]);
+        if (std::strcmp(argv[i], "--threads") == 0 && i + 1 < argc) n_cpu_threads = atoi(argv[++i]);
+        if (std::strcmp(argv[i], "--max-rss-mb") == 0 && i + 1 < argc) max_rss_mb = atoi(argv[++i]);
     }
     if (generate_mode || repl_mode) {
         std::mt19937 rng(rng_seed > 0 ? rng_seed : std::random_device{}());
@@ -206,6 +217,11 @@ int main(int argc, char ** argv) {
         // ggml setup
         ggml_backend_t backend = ggml_backend_cpu_init();
         if (!backend) { std::fprintf(stderr, "lamio: backend init failed\n"); return 1; }
+        // Use the configured CPU thread count. Default 1 preserves the original
+        // single-thread behavior (optimal for small models where thread sync
+        // overhead exceeds matmul gains); scale up via `--threads N` for large
+        // models (e.g. Ornith-35B) where multi-core matmuls win big.
+        ggml_backend_cpu_set_n_threads(backend, n_cpu_threads < 1 ? 1 : n_cpu_threads);
 
         // Weight context
         size_t wpool = ggml_tensor_overhead() * (size_t)(cfg.n_layers * 30 + 256) + 64*1024*1024;
@@ -326,6 +342,48 @@ int main(int argc, char ** argv) {
         ggml_backend_buffer_t wbackend_buf = ggml_backend_alloc_ctx_tensors(wctx, backend);
         if (!wbackend_buf) { std::fprintf(stderr, "lamio: weight alloc failed (all tensors zero/allocated)\\n"); return 1; }
         std::fprintf(stderr, "mmap: backend buffer %zu MB, alloc OK\n", ggml_backend_buffer_get_size(wbackend_buf) / (1024*1024));
+
+        // --- Expert Router: MoE-aware RSS orchestration ---
+        // Register per-expert slices so eviction is granular (per expert, not
+        // per layer). Each MoE weight tensor [d0, d1, n_experts] has stride
+        // d0*d1*type per expert. The 3 tensors (gate/up/down) are ~142MB apart
+        // in memory, so we register ONE slice per tensor per expert rather
+        // than one big range (otherwise madvise would free the gap pages too).
+        lamio::ExpertRouter expert_router;
+        if (max_rss_mb > 0 && cfg.n_experts > 0) {
+            expert_router.configure((size_t)max_rss_mb * 1024 * 1024);
+            int slice_counter = 0;
+            for (auto & kv : wl.refs_map()) {
+                ggml_tensor * t = kv.first;
+                const lamio::TensorRef & ref = kv.second;
+                if (ref.tensor_idx < 0 || t->data == nullptr) continue;
+                bool is_exp = (ref.name.find("ffn_gate_exps") != std::string::npos ||
+                               ref.name.find("ffn_up_exps")   != std::string::npos ||
+                               ref.name.find("ffn_down_exps") != std::string::npos);
+                if (!is_exp) continue;
+                int layer = -1;
+                auto dot = ref.name.find('.');
+                if (dot != std::string::npos) layer = std::atoi(ref.name.c_str() + dot + 1);
+                if (layer < 0 || layer >= cfg.n_layers) continue;
+                size_t per_exp = (size_t)t->nb[2];
+                uintptr_t base = (uintptr_t)t->data;
+                // Determine tensor type tag for find_slice lookup
+                int tag = 0;
+                if (ref.name.find("gate_exps") != std::string::npos) tag = 1;
+                else if (ref.name.find("up_exps") != std::string::npos) tag = 2;
+                else tag = 3;
+                for (int e = 0; e < cfg.n_experts; ++e) {
+                    uintptr_t a = base + (size_t)e * per_exp;
+                    expert_router.add_expert(a, per_exp, layer, e, tag);
+                    ++slice_counter;
+                }
+            }
+            size_t trunk_rss = ggml_backend_buffer_get_size(wbackend_buf);
+            expert_router.set_base_rss(trunk_rss + 256ULL*1024*1024 + 128ULL*1024*1024);
+            std::fprintf(stderr, "expert_router: %zu expert slices (40L x 256E x 3T), budget=%dMB, base_rss=%zuMB\n",
+                         expert_router.slice_count(), max_rss_mb,
+                         expert_router.estimate_rss() / (1024*1024));
+        }
 
         // Copy trunk tensor data from mmap into backend buffer
         size_t n_trunk = 0;
@@ -645,21 +703,27 @@ int main(int argc, char ** argv) {
             return 0;
         }
 
-        // --- One-shot generate mode (original) ---
+        // --- One-shot generate mode ---
+        // Pre-allocate the compute/input scratch buffers ONCE. Re-initializing
+        // the ggml contexts on the same malloc'd buffer each step (instead of
+        // malloc/free 384MB per token) removes page-table churn and heap
+        // fragmentation from the decode hot path.
+        void * cbuf = malloc(256 * 1024 * 1024);
+        void * ibuf = malloc((size_t)ggml_tensor_overhead() * 64 + 128 * 1024 * 1024);
+        ggml_cgraph * gf = nullptr;
         for (int gen_step = 0; gen_step < n_gen_tokens; ++gen_step) {
             bool is_prefill = (gen_step == 0);
             int n_tokens = is_prefill ? (int)all_ids.size() : 1;
 
-            // Compute context (recreated each step)
-            size_t compute_ctx_size = 256 * 1024 * 1024;
-            void * cbuf = malloc(compute_ctx_size);
-            struct ggml_init_params cparams = { compute_ctx_size, cbuf, true };
-            ggml_context * cctx = ggml_init(cparams);
+            // Proactive eviction BEFORE compute: keep RSS budget tight so the
+            // upcoming compute doesn't fault cold pages back in unnecessarily.
+            if (!is_prefill && max_rss_mb > 0) {
+                expert_router.maybe_evict(gen_step);
+            }
 
-            // Input context
-            size_t ictx_size = ggml_tensor_overhead() * 64 + 128 * 1024 * 1024;
-            void * ibuf = malloc(ictx_size);
-            struct ggml_init_params iparams = { ictx_size, ibuf, true };
+            struct ggml_init_params cparams = { 256 * 1024 * 1024, cbuf, true };
+            ggml_context * cctx = ggml_init(cparams);
+            struct ggml_init_params iparams = { (size_t)ggml_tensor_overhead() * 64 + 128 * 1024 * 1024, ibuf, true };
             ggml_context * ictx = ggml_init(iparams);
 
             // Position IDs
@@ -689,16 +753,18 @@ int main(int argc, char ** argv) {
             const int lim = (max_layers < 0 || max_layers > cfg.n_layers) ? cfg.n_layers : max_layers;
             std::vector<ggml_tensor *> all_zero_init;
             std::vector<lamio::LayerState> layer_states(lim);
+            std::vector<ggml_tensor *> selected_tensors; // MoE router: top-k indices per layer
 
             // Create graph early and expand per-layer to avoid stack overflow
             // on deep models (40+ MoE layers cause deep recursion in build_forward_expand)
             // Use custom size: 40 layers x ~100 ops/layer + slack
             size_t graph_size = (size_t)lim * 256 + 2048;
-            ggml_cgraph * gf = ggml_new_graph_custom(cctx, graph_size, false);
+            gf = ggml_new_graph_custom(cctx, graph_size, false);
 
             for (int l = 0; l < lim; ++l) {
                 bool is_recr = (l + 1) % 4 != 0;
                 lamio::Qwen35Forward fwd{cfg, hp, wl, cctx, is_recr};
+                fwd.want_selected = (max_rss_mb > 0 && cfg.n_experts > 0 && !is_prefill);
 
                 lamio::LayerState & ls = layer_states[l];
                 ls.want_state = (p_conv_state[l] != nullptr);  // always extract state for GDN layers
@@ -756,6 +822,13 @@ int main(int argc, char ** argv) {
                 if (ls.ssm_state_out)  ggml_build_forward_expand(gf, ls.ssm_state_out);
                 if (ls.kv_k_out)       ggml_build_forward_expand(gf, ls.kv_k_out);
                 if (ls.kv_v_out)       ggml_build_forward_expand(gf, ls.kv_v_out);
+                // MoE router: expand the selected-experts output so it gets computed
+                if (fwd.selected_experts) {
+                    ggml_build_forward_expand(gf, fwd.selected_experts);
+                    selected_tensors.push_back(fwd.selected_experts);
+                } else {
+                    selected_tensors.push_back(nullptr);
+                }
                 if (!x) { std::fprintf(stderr, "lamio: forward block %d failed\n", l); break; }
                 for (auto * t : fwd.zero_init) all_zero_init.push_back(t);
             }
@@ -781,8 +854,8 @@ int main(int argc, char ** argv) {
             ggml_backend_sched_reset(sched);
             if (!ggml_backend_sched_alloc_graph(sched, gf)) {
                 std::fprintf(stderr, "lamio: sched alloc failed (step %d)\n", gen_step);
-                ggml_free(cctx); free(cbuf);
-                ggml_free(ictx); free(ibuf);
+                ggml_free(cctx);
+                ggml_free(ictx);
                 break;
             }
 
@@ -823,8 +896,8 @@ int main(int argc, char ** argv) {
             ggml_status status = ggml_backend_sched_graph_compute(sched, gf);
             if (status != GGML_STATUS_SUCCESS) {
                 std::fprintf(stderr, "lamio: compute failed (step %d)\n", gen_step);
-                ggml_free(cctx); free(cbuf);
-                ggml_free(ictx); free(ibuf);
+                ggml_free(cctx);
+                ggml_free(ictx);
                 break;
             }
 
@@ -854,6 +927,31 @@ int main(int argc, char ** argv) {
             ggml_backend_tensor_get(logits, logits_buf.data(),
                 (n_tokens - 1) * cfg.vocab_size * sizeof(float),
                 cfg.vocab_size * sizeof(float));
+
+            // MoE router: read selected experts and drive eviction
+            if (max_rss_mb > 0 && cfg.n_experts > 0 && !is_prefill && !selected_tensors.empty()) {
+                static uint64_t moe_tick = 0;
+                moe_tick++;
+                for (int l = 0; l < lim && l < (int)selected_tensors.size(); ++l) {
+                    ggml_tensor * sel = selected_tensors[l];
+                    if (!sel) continue;
+                    int n_act = (int)sel->ne[0];   // n_expert_used
+                    int n_tok = (int)sel->ne[1];   // should be 1 for decode
+                    std::vector<int32_t> idxs(n_act * n_tok);
+                    ggml_backend_tensor_get(sel, idxs.data(), 0, idxs.size() * sizeof(int32_t));
+                    // Dedupe by expert_id (selected_experts may repeat)
+                    std::vector<int> seen;
+                    for (int k = 0; k < n_act * n_tok; ++k) {
+                        int expert_id = idxs[k];
+                        bool dup = false;
+                        for (int s : seen) if (s == expert_id) { dup = true; break; }
+                        if (dup) continue;
+                        seen.push_back(expert_id);
+                        expert_router.touch_expert(l, expert_id, moe_tick);
+                    }
+                }
+                expert_router.maybe_evict(moe_tick);
+            }
 
             // Sample next token
             int32_t best_id;
@@ -896,11 +994,12 @@ int main(int argc, char ** argv) {
             }
 
             ggml_free(ictx);
-            free(ibuf);
             ggml_free(cctx);
-            free(cbuf);
         }
 
+        // Free the pre-allocated scratch buffers once
+        free(ibuf);
+        free(cbuf);
         ggml_backend_sched_free(sched);
 
         // Decode all generated tokens
