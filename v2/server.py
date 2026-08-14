@@ -44,28 +44,8 @@ def get_rss():
 
 
 def build_chatml_prompt(messages, model_name='', chat_template=''):
-    """Build a prompt using the model's chat_template (Jinja2) if available."""
-    if chat_template:
-        try:
-            from jinja2 import Template
-            tmpl = Template(chat_template)
-            prompt = tmpl.render(
-                messages=messages,
-                add_generation_prompt=True,
-                enable_thinking=True,  # enable thinking so model generates reasoning before answer
-            )
-            return prompt
-        except Exception as e:
-            log.warning(f'jinja render failed: {e}, falling back to ChatML')
-
-    # Fallback: ChatML
-    has_assistant = any(m.get('role') == 'assistant' for m in messages)
-    if not has_assistant:
-        context = ''
-        for msg in messages[:-1]:
-            context += msg.get('content', '') + ' '
-        prompt = context + messages[-1].get('content', '') if messages else ''
-        return prompt
+    """Build a ChatML prompt. Always uses plain ChatML (no Jinja2 template)
+    to avoid the model's thinking block injection which produces artifacts."""
     prompt = ''
     for msg in messages:
         role = msg.get('role', 'user')
@@ -332,19 +312,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 for ss in stop_strings:
                     if ss in text:
                         text = text[:text.index(ss)]
-                # Strip <|im_end|> (keep <|im_start|> for now)
-                text = text.replace('<|im_end|>', '')
-                # Extract content after think block (skip reasoning)
+                # Strip all special tokens that leak into output
+                SPECIAL_TOKENS = ['<|im_end|>', '<|im_start|>', '<|think|>', '<|/think|>']
+                for st in SPECIAL_TOKENS:
+                    text = text.replace(st, '')
+                # If model generated a think block, take only content after it
+                THINK_START = chr(60) + 'think' + chr(62)
                 THINK_END = chr(60) + chr(47) + 'think' + chr(62)
                 if THINK_END in text:
                     text = text.split(THINK_END)[-1]
-                    # Strip leading junk (residual think remnants, newlines)
-                    text = text.lstrip(' \n\r\t')
-                    # Also strip any non-printable leading chars
-                    while text and ord(text[0]) < 32:
-                        text = text[1:]
-                # Now strip <|im_start|> and any remaining special tokens
-                text = text.replace('<|im_start|>', '')
+                elif THINK_START in text:
+                    # Model started thinking but never closed - take everything after think start
+                    text = text.split(THINK_START)[-1]
+                # Strip leading whitespace and non-printable chars
+                text = text.lstrip(' \n\r\t')
+                while text and ord(text[0]) < 32:
+                    text = text[1:]
+                # Strip trailing special token remnants
                 text = text.strip()
 
                 gen_lines = [l for l in result.stdout.splitlines()
@@ -412,6 +396,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                             elif line_str.startswith('piece:'):
                                 # Decoded token piece
                                 piece = line_str[6:]
+                                # Skip special tokens — never stream them
+                                SPECIAL = ['<|im_end|>', '<|im_start|>', '<|think|>', '<|/think|>']
+                                if piece in SPECIAL:
+                                    continue
                                 # Check for stop strings
                                 full_text += piece
                                 # Check if any stop string is in the text
@@ -424,7 +412,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                         break
                                 if stop_found:
                                     self._sse_send({
-                                        'choices': [{'delta': {'content': piece}, 'finish_reason': 'stop'}]
+                                        'choices': [{'delta': {}, 'finish_reason': 'stop'}]
                                     })
                                     break
                                 if not stop_found:
