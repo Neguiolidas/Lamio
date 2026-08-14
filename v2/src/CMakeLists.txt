@@ -14,20 +14,19 @@ target_include_directories(lamio_core PUBLIC
 )
 
 # ggml.c separated into ggml.so (base ops) + ggml-base.so (GGUF parser, etc.).
-# ggml-cpu.so has the CPU backend init.
+# ggml libs: base (GGUF parser), cpu (CPU backend), cuda (GPU backend, loaded via dlopen at runtime)
 find_library(GGML_BASE_LIB NAMES ggml-base PATHS ${GGML_BUILD_DIR}/bin NO_DEFAULT_PATH)
 find_library(GGML_CPU_LIB  NAMES ggml-cpu  PATHS ${GGML_BUILD_DIR}/bin NO_DEFAULT_PATH)
 find_library(GGML_CUDA_LIB NAMES ggml-cuda PATHS ${GGML_BUILD_DIR}/bin NO_DEFAULT_PATH)
 if(GGML_BASE_LIB)
-  message(STATUS "Lamio v2 also linking libggml-base: ${GGML_BASE_LIB}")
+  message(STATUS "Lamio v2 linking libggml-base: ${GGML_BASE_LIB}")
 endif()
 if(GGML_CPU_LIB)
-  message(STATUS "Lamio v2 also linking libggml-cpu: ${GGML_CPU_LIB}")
+  message(STATUS "Lamio v2 linking libggml-cpu: ${GGML_CPU_LIB}")
 endif()
 if(GGML_CUDA_LIB)
-  message(STATUS "Lamio v2 also linking libggml-cuda: ${GGML_CUDA_LIB}")
-  target_link_libraries(lamio_core PUBLIC ${GGML_CUDA_LIB})
-  target_compile_definitions(lamio_core PUBLIC LAMIO_GPU_CUDA=1)
+  message(STATUS "Lamio v2 linking libggml-cuda: ${GGML_CUDA_LIB}")
+  target_link_libraries(lamio_core PUBLIC ${GGML_CUDA_LIB} dl)
 endif()
 
 target_link_libraries(lamio_core PUBLIC ${GGML_LIB} ${GGML_BASE_LIB} ${GGML_CPU_LIB} pthread)

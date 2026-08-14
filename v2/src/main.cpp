@@ -24,7 +24,6 @@
 
 #include "ggml.h"
 #include "ggml-backend.h"
-#include "ggml-cuda.h"
 #include "ggml-cpu.h"
 
 static void print_info(const char * path) {
@@ -215,19 +214,48 @@ int main(int argc, char ** argv) {
         // Parse qwen35 hparams
         lamio::Qwen35HParams hp = lamio::parse_qwen35_hparams(cfg, r);
 
-        // ggml setup
+        // ggml setup — auto-detect best backend (GPU of any kind, then CPU)
         ggml_backend_t backend = nullptr;
         ggml_backend_t gpu_backend = nullptr;
-        // Prefer GPU if available; fall back to CPU.
-#ifdef LAMIO_GPU_CUDA
-        gpu_backend = ggml_backend_cuda_init(0);
-        if (gpu_backend) {
-            fprintf(stderr, "lamio: using CUDA GPU backend\n");
-            backend = gpu_backend;
-        } else
-#endif
-        { backend = ggml_backend_cpu_init(); }
-        if (!backend) { std::fprintf(stderr, "lamio: backend init failed\n"); return 1; }
+        ggml_backend_buffer_type_t gpu_buft = nullptr;
+        size_t gpu_free_mem = 0, gpu_total_mem = 0;
+        const char * gpu_name = nullptr;
+
+        // Load all available backend plugins (CUDA, Metal, Vulkan, etc.)
+        ggml_backend_load_all();
+
+        // Try GPU first (any type: CUDA, Metal, Vulkan, ROCm)
+        ggml_backend_dev_t gpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        if (!gpu_dev) {
+            // Try integrated GPU (shares host memory)
+            gpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU);
+        }
+        if (gpu_dev) {
+            ggml_backend_dev_props props;
+            ggml_backend_dev_get_props(gpu_dev, &props);
+            gpu_name = props.name;
+            gpu_free_mem = props.memory_free;
+            gpu_total_mem = props.memory_total;
+            fprintf(stderr, "lamio: GPU detected: %s (%s) free=%zuMB total=%zuMB\n",
+                    props.name ? props.name : "?",
+                    props.description ? props.description : "?",
+                    gpu_free_mem / (1024*1024), gpu_total_mem / (1024*1024));
+
+            gpu_backend = ggml_backend_dev_init(gpu_dev, nullptr);
+            if (gpu_backend) {
+                gpu_buft = ggml_backend_dev_buffer_type(gpu_dev);
+                backend = gpu_backend;
+                fprintf(stderr, "lamio: using GPU backend: %s\n", gpu_name ? gpu_name : "unknown");
+            } else {
+                fprintf(stderr, "lamio: GPU init failed, falling back to CPU\n");
+            }
+        }
+
+        if (!backend) {
+            backend = ggml_backend_cpu_init();
+            if (!backend) { std::fprintf(stderr, "lamio: backend init failed\n"); return 1; }
+            fprintf(stderr, "lamio: using CPU backend\n");
+        }
         // Use the configured CPU thread count. Default 1 preserves the original
         // single-thread behavior (optimal for small models where thread sync
         // overhead exceeds matmul gains); scale up via `--threads N` for large
@@ -424,20 +452,18 @@ int main(int argc, char ** argv) {
 
         // Create the backend scheduler (reused across all gen steps)
         ggml_backend_sched_t sched = nullptr;
-#ifdef LAMIO_GPU_CUDA
-        if (gpu_backend) {
-            ggml_backend_t backends[2] = { gpu_backend, backend };
-            ggml_backend_buffer_type_t bufts[2] = {
-                ggml_backend_cuda_buffer_type(0),
-                ggml_backend_cpu_buffer_type()
-            };
+        if (gpu_backend && gpu_buft) {
+            // GPU + CPU fallback scheduler
+            ggml_backend_t backends[2] = { gpu_backend, ggml_backend_cpu_init() };
+            ggml_backend_buffer_type_t bufts[2] = { gpu_buft, ggml_backend_cpu_buffer_type() };
             sched = ggml_backend_sched_new(backends, bufts, 2, 16384, false, false);
-        } else
-#endif
-        {
+            fprintf(stderr, "lamio: scheduler: GPU+CPU (2 backends)\n");
+        } else {
+            // CPU-only scheduler
             ggml_backend_t sched_backends[1] = { backend };
             ggml_backend_buffer_type_t sched_bufts[1] = { ggml_backend_cpu_buffer_type() };
             sched = ggml_backend_sched_new(sched_backends, sched_bufts, 1, 16384, false, false);
+            fprintf(stderr, "lamio: scheduler: CPU-only (1 backend)\n");
         }
         if (!sched) {
             std::fprintf(stderr, "lamio: failed to create backend scheduler\n");
